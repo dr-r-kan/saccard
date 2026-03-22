@@ -14,13 +14,38 @@ video metadata, and a Plotly figure for every requested method.
 """
 
 import os
+import warnings
 import cv2
 import numpy as np
 import plotly.graph_objects as go
 from importlib import import_module
 
+
+def _configure_runtime_warnings():
+    # Configure runtime knobs before TensorFlow/MediaPipe are imported.
+    os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')
+    os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
+    os.environ.setdefault('GLOG_minloglevel', '2')
+
+    warnings.filterwarnings(
+        'ignore',
+        message=r'.*tf\.losses\.sparse_softmax_cross_entropy is deprecated.*',
+    )
+    warnings.filterwarnings(
+        'ignore',
+        message=r'.*cupyx\.jit\.rawkernel is experimental.*',
+        category=FutureWarning,
+    )
+    warnings.filterwarnings(
+        'ignore',
+        message=r'.*SymbolDatabase\.GetPrototype\(\) is deprecated.*',
+        category=UserWarning,
+    )
+
+
+_configure_runtime_warnings()
+
 import pyVHR
-import pyVHR.BVP.methods as _bvp_methods
 from pyVHR.extraction.sig_processing import (
     SignalProcessing,
     SignalProcessingParams,
@@ -30,7 +55,7 @@ from pyVHR.extraction.skin_extraction_methods import (
     SkinExtractionConvexHull,
     SkinExtractionFaceParsing,
 )
-from pyVHR.extraction.utils import sig_windowing, get_fps
+from pyVHR.extraction.utils import sig_windowing, get_fps, sliding_straded_win_idx
 from pyVHR.BVP.BVP import RGB_sig_to_BVP
 from pyVHR.BVP.filters import BPfilter, apply_filter
 from pyVHR.BPM.BPM import BVP_to_BPM, BPM_median
@@ -56,6 +81,31 @@ _CPU_METHODS = [
 _FPS_PARAM_METHODS = {'cpu_POS', 'cpu_SSR'}
 # Methods that need a component selector
 _COMP_PARAM_METHODS = {'cpu_PCA', 'cpu_ICA'}
+
+
+def _cupy_cuda_available():
+    try:
+        import cupy
+        return cupy.cuda.runtime.getDeviceCount() > 0
+    except Exception:
+        return False
+
+
+def _torch_cuda_available():
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+def _select_bvp_backend(method_name, bvp_module):
+    """Pick GPU implementation when available, else fall back to the requested method."""
+    if method_name.startswith('cpu_') and _cupy_cuda_available():
+        gpu_method = f"cupy_{method_name[4:]}"
+        if hasattr(bvp_module, gpu_method):
+            return gpu_method, 'cuda'
+    return method_name, 'cpu'
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -111,6 +161,19 @@ def _bpm_from_1d_bvp(bvp_signal, fps, winsize_s):
         seg = bvp_signal[st:en].reshape(1, -1).astype(np.float32)
         bvps_win.append(seg)
     return _bpm_from_bvp_windows(bvps_win, fps)
+
+
+def _window_raw_frames(raw_frames, winsize_s, stride_s, fps):
+    """Window raw RGB frames into a list compatible with cpu_SSR."""
+    n_frames = len(raw_frames)
+    if n_frames == 0:
+        return []
+    block_idx, _ = sliding_straded_win_idx(n_frames, winsize_s, stride_s, fps)
+    windows = []
+    for idx in block_idx:
+        frame_idx = idx.astype(np.int32)
+        windows.append(raw_frames[frame_idx])
+    return windows
 
 
 def _make_plot(times, bpm_dict):
@@ -198,6 +261,7 @@ def saccard(
 
     classical = [m for m in methods if m != 'MTTS_CAN']
     run_mtts  = 'MTTS_CAN' in methods
+    run_ssr = 'cpu_SSR' in classical
 
     # ── 1. video source ────────────────────────────────────────────────────────
     is_stream = isinstance(video, int)
@@ -216,9 +280,11 @@ def saccard(
     sig_proc.set_total_frames(0)
 
     if roi_method == 'convexhull':
-        sig_proc.set_skin_extractor(SkinExtractionConvexHull('CPU'))
+        skin_device = 'GPU' if _cupy_cuda_available() else 'CPU'
+        sig_proc.set_skin_extractor(SkinExtractionConvexHull(skin_device))
     elif roi_method == 'faceparsing':
-        sig_proc.set_skin_extractor(SkinExtractionFaceParsing('CPU'))
+        skin_device = 'GPU' if _torch_cuda_available() else 'CPU'
+        sig_proc.set_skin_extractor(SkinExtractionFaceParsing(skin_device))
     else:
         raise ValueError(f"Unknown roi_method '{roi_method}'")
 
@@ -253,9 +319,9 @@ def saccard(
 
     # Also get raw frames for MTTS-CAN
     raw_frames = None
-    if run_mtts:
+    if run_mtts or run_ssr:
         if verb:
-            print("[saccard] extracting raw frames for MTTS-CAN …")
+            print("[saccard] extracting raw frames …")
         raw_frames = sig_proc.extract_raw(video_source)  # [frames, H, W, 3]
 
     # clean up temp file if we created one
@@ -264,6 +330,9 @@ def saccard(
 
     # ── 3. windowing ──────────────────────────────────────────────────────────
     windowed_sig, times = sig_windowing(sig, winsize, 1, fps)
+    raw_windowed_sig = None
+    if run_ssr and raw_frames is not None and len(raw_frames) > 0:
+        raw_windowed_sig = _window_raw_frames(raw_frames, winsize, 1, fps)
     if verb:
         print(f"[saccard] {len(windowed_sig)} windows of {winsize}s")
 
@@ -282,7 +351,8 @@ def saccard(
         if verb:
             print(f"[saccard] running {method} …")
 
-        func = getattr(bvp_mod, method)
+        runtime_method, runtime_device = _select_bvp_backend(method, bvp_mod)
+        func = getattr(bvp_mod, runtime_method)
 
         if method in _FPS_PARAM_METHODS:
             params = {'fps': 'adaptive'}
@@ -291,9 +361,11 @@ def saccard(
         else:
             params = {}
 
+        method_input = raw_windowed_sig if method == 'cpu_SSR' and raw_windowed_sig is not None else windowed_sig
+
         bvps_win = RGB_sig_to_BVP(
-            windowed_sig, fps,
-            device_type='cpu',
+            method_input, fps,
+            device_type=runtime_device,
             method=func,
             params=params,
         )

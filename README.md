@@ -1,6 +1,6 @@
 # saccard
 
-**saccard** extracts cardiac data (BVP signals, heart rate BPM, metadata, and plots) from a video file or live webcam stream using remote photoplethysmography (rPPG).
+**saccard** extracts cardiac data (BVP signals, heart rate BPM, metadata, and plots) from a video file or live webcam stream using remote photoplethysmography (rPPG). It is a fork from pyVHR - with reduced cardiac complexity, and instead a focus on ocular behaviour.
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
@@ -24,11 +24,50 @@ Plus the deep-learning method **`MTTS_CAN`** (Liu et al., 2020).
 
 ## Installation
 
+One-command reproducible GPU setup (Windows PowerShell):
+
+```powershell
+./scripts/setup_gpu_env.ps1
+```
+
+Compatibility alias (same behavior):
+
+```powershell
+./scripts/setup_gpu_envs.ps1
+```
+
+If you want to rebuild from scratch:
+
+```powershell
+./scripts/setup_gpu_env.ps1 -Recreate
+```
+
+Manual equivalent:
+
 ```bash
+conda create -n saccard-gpu python=3.9 -y
+conda activate saccard-gpu
+
+# CUDA 12 compatible GPU stack (recommended, reproducible)
+conda install pytorch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 pytorch-cuda=12.1 -c pytorch -c nvidia -y
+
+# Project dependencies (excluding torch packages by design)
+pip install -r requirements.txt
 pip install -e .
 ```
 
-> A GPU is not required. CUDA support is used automatically when available.
+Verify GPU runtime:
+
+```bash
+python -c "import torch, cupy; print('torch', torch.__version__); print('torch_cuda', torch.cuda.is_available()); print('cupy_devices', cupy.cuda.runtime.getDeviceCount())"
+```
+
+Expected output includes `torch_cuda True` and `cupy_devices >= 1`.
+
+Important:
+
+- Do not run `pip install torch torchvision torchaudio` in this environment after the conda step above.
+- This project auto-selects GPU execution when CUDA backends are available.
 
 ## Quick start
 

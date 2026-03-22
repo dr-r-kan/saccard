@@ -426,9 +426,17 @@ def BPM_median(bpms):
     """
     median_bpms = np.zeros((len(bpms),))
     MAD = np.zeros((len(bpms),))
-    for i,bpm in enumerate(bpms):
-        median_bpms[i] = np.float32(np.median(bpm))
-        MAD[i] = np.float32(mad(bpm))                
+    for i, bpm in enumerate(bpms):
+        bpm_arr = np.asarray(bpm)
+        if bpm_arr.size == 0:
+            median_bpms[i] = np.float32(0.0)
+            MAD[i] = np.float32(0.0)
+            continue
+
+        # Force 1-D so scalar windows are handled consistently.
+        bpm_arr = np.atleast_1d(bpm_arr)
+        median_bpms[i] = np.float32(np.median(bpm_arr))
+        MAD[i] = np.float32(mad(bpm_arr, axis=None))
     return median_bpms, MAD
 
 def BVP_to_BPM(bvps, fps, minHz=0.65, maxHz=4.):

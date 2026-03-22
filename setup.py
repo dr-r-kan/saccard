@@ -1,14 +1,19 @@
+from pathlib import Path
 import setuptools
-import os
 
-requirementPath = 'requirements.txt'
-reqs = []
-if os.path.isfile(requirementPath):
-    with open(requirementPath) as f:
-        reqs = f.read().splitlines()
 
-with open("README.md", "r") as fh:
-    long_description = fh.read()
+def _read_requirements(path):
+    reqs = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        reqs.append(line)
+    return reqs
+
+
+reqs = _read_requirements("requirements.txt") if Path("requirements.txt").is_file() else []
+long_description = Path("README.md").read_text(encoding="utf-8")
 
 setuptools.setup(
     name="saccard",

@@ -12,6 +12,7 @@ dependencies:
   - torchaudio=2.1.0
   - pytorch-cuda=12.1
   - cupy=13.0.0
+  - numpy<2
   - hdf5>=1.12
   - pip>=23.0
   - pytables>=3.7
@@ -29,4 +30,4 @@ dependencies:
     - scikit_posthocs==0.6.7
     - scikit-image>=0.19
     - tqdm>=4.62.3
-    - tensorflow>=2.13.0
+    - tensorflow>=2.13.0,<2.16

@@ -2,6 +2,11 @@ import os
 import requests
 import pyVHR
 import numpy as np
+
+# Keep TensorFlow startup noise low for library use.
+os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
+
 import tensorflow as tf
 from .MTTS_CAN.model import Attention_mask, MTTS_CAN
 from scipy.signal import butter
@@ -9,6 +14,13 @@ import scipy.signal
 import cv2
 from skimage.util import img_as_float
 from scipy.sparse import spdiags
+
+tf.get_logger().setLevel('ERROR')
+try:
+  from tensorflow.python.util import deprecation as _tf_deprecation
+  _tf_deprecation._PRINT_DEPRECATION_WARNINGS = False
+except Exception:
+  pass
 
 def preprocess_raw_video(frames, fs=30, dim=36):
   """A slightly different version from the original: 

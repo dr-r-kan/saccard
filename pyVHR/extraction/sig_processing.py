@@ -1,11 +1,41 @@
+import os
+import sys
 import cv2
 import math
+from contextlib import contextmanager
+
+# Must be set before importing mediapipe/tflite backends.
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
+os.environ.setdefault('GLOG_minloglevel', '3')
+
 import mediapipe as mp
 import numpy as np
+from absl import logging as absl_logging
 from pyVHR.extraction.utils import *
 from pyVHR.extraction.skin_extraction_methods import *
 from pyVHR.extraction.sig_extraction_methods import *
 from pyVHR.utils.cuda_utils import *
+
+absl_logging.set_verbosity(absl_logging.ERROR)
+
+
+@contextmanager
+def _suppress_native_stderr():
+    """Temporarily silence native C/C++ logs written directly to stderr."""
+    try:
+        stderr_fd = sys.stderr.fileno()
+    except Exception:
+        yield
+        return
+
+    saved_stderr_fd = os.dup(stderr_fd)
+    try:
+        with open(os.devnull, 'w') as devnull:
+            os.dup2(devnull.fileno(), stderr_fd)
+            yield
+    finally:
+        os.dup2(saved_stderr_fd, stderr_fd)
+        os.close(saved_stderr_fd)
 
 """
 This module defines classes or methods used for Signal extraction and processing.
@@ -177,46 +207,47 @@ class SignalProcessing():
         sig = []
         processed_frames_count = 0
 
-        with mp_face_mesh.FaceMesh(
-                max_num_faces=1,
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5) as face_mesh:
-            for frame in extract_frames_yield(videoFileName):
-                # convert the BGR image to RGB.
-                image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                processed_frames_count += 1
-                width = image.shape[1]
-                height = image.shape[0]
-                # [landmarks, info], with info->x_center ,y_center, r, g, b
-                ldmks = np.zeros((468, 5), dtype=np.float32)
-                ldmks[:, 0] = -1.0
-                ldmks[:, 1] = -1.0
-                ### face landmarks ###
-                results = face_mesh.process(image)
-                if results.multi_face_landmarks:
-                    face_landmarks = results.multi_face_landmarks[0]
-                    landmarks = [l for l in face_landmarks.landmark]
-                    for idx in range(len(landmarks)):
-                        landmark = landmarks[idx]
-                        if _landmark_is_valid(landmark):
-                            coords = _normalized_to_pixel_coordinates(
-                                landmark.x, landmark.y, width, height)
-                            if coords:
-                                ldmks[idx, 0] = coords[1]
-                                ldmks[idx, 1] = coords[0]
-                    ### skin extraction ###
-                    cropped_skin_im, full_skin_im = skin_ex.extract_skin(
-                        image, ldmks)
-                else:
-                    cropped_skin_im = np.zeros_like(image)
-                    full_skin_im = np.zeros_like(image)
-                if self.visualize_skin == True:
-                    self.visualize_skin_collection.append(full_skin_im)
-                ### sig computing ###
-                sig.append(full_skin_im)
-                ### loop break ###
-                if self.tot_frames is not None and self.tot_frames > 0 and processed_frames_count >= self.tot_frames:
-                    break
+        with _suppress_native_stderr():
+            with mp_face_mesh.FaceMesh(
+                    max_num_faces=1,
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5) as face_mesh:
+                for frame in extract_frames_yield(videoFileName):
+                    # convert the BGR image to RGB.
+                    image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    processed_frames_count += 1
+                    width = image.shape[1]
+                    height = image.shape[0]
+                    # [landmarks, info], with info->x_center ,y_center, r, g, b
+                    ldmks = np.zeros((468, 5), dtype=np.float32)
+                    ldmks[:, 0] = -1.0
+                    ldmks[:, 1] = -1.0
+                    ### face landmarks ###
+                    results = face_mesh.process(image)
+                    if results.multi_face_landmarks:
+                        face_landmarks = results.multi_face_landmarks[0]
+                        landmarks = [l for l in face_landmarks.landmark]
+                        for idx in range(len(landmarks)):
+                            landmark = landmarks[idx]
+                            if _landmark_is_valid(landmark):
+                                coords = _normalized_to_pixel_coordinates(
+                                    landmark.x, landmark.y, width, height)
+                                if coords:
+                                    ldmks[idx, 0] = coords[1]
+                                    ldmks[idx, 1] = coords[0]
+                        ### skin extraction ###
+                        cropped_skin_im, full_skin_im = skin_ex.extract_skin(
+                            image, ldmks)
+                    else:
+                        cropped_skin_im = np.zeros_like(image)
+                        full_skin_im = np.zeros_like(image)
+                    if self.visualize_skin == True:
+                        self.visualize_skin_collection.append(full_skin_im)
+                    ### sig computing ###
+                    sig.append(full_skin_im)
+                    ### loop break ###
+                    if self.tot_frames is not None and self.tot_frames > 0 and processed_frames_count >= self.tot_frames:
+                        break
         sig = np.array(sig, dtype=np.float32)
         return sig
 
@@ -240,47 +271,48 @@ class SignalProcessing():
         sig = []
         processed_frames_count = 0
 
-        with mp_face_mesh.FaceMesh(
-                max_num_faces=1,
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5) as face_mesh:
-            for frame in extract_frames_yield(videoFileName):
-                # convert the BGR image to RGB.
-                image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                processed_frames_count += 1
-                width = image.shape[1]
-                height = image.shape[0]
-                # [landmarks, info], with info->x_center ,y_center, r, g, b
-                ldmks = np.zeros((468, 5), dtype=np.float32)
-                ldmks[:, 0] = -1.0
-                ldmks[:, 1] = -1.0
-                ### face landmarks ###
-                results = face_mesh.process(image)
-                if results.multi_face_landmarks:
-                    face_landmarks = results.multi_face_landmarks[0]
-                    landmarks = [l for l in face_landmarks.landmark]
-                    for idx in range(len(landmarks)):
-                        landmark = landmarks[idx]
-                        if _landmark_is_valid(landmark):
-                            coords = _normalized_to_pixel_coordinates(
-                                landmark.x, landmark.y, width, height)
-                            if coords:
-                                ldmks[idx, 0] = coords[1]
-                                ldmks[idx, 1] = coords[0]
-                    ### skin extraction ###
-                    cropped_skin_im, full_skin_im = skin_ex.extract_skin(
-                        image, ldmks)
-                else:
-                    cropped_skin_im = np.zeros_like(image)
-                    full_skin_im = np.zeros_like(image)
-                if self.visualize_skin == True:
-                    self.visualize_skin_collection.append(full_skin_im)
-                ### sig computing ###
-                sig.append(holistic_mean(
-                    cropped_skin_im, np.int32(SignalProcessingParams.RGB_LOW_TH), np.int32(SignalProcessingParams.RGB_HIGH_TH)))
-                ### loop break ###
-                if self.tot_frames is not None and self.tot_frames > 0 and processed_frames_count >= self.tot_frames:
-                    break
+        with _suppress_native_stderr():
+            with mp_face_mesh.FaceMesh(
+                    max_num_faces=1,
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5) as face_mesh:
+                for frame in extract_frames_yield(videoFileName):
+                    # convert the BGR image to RGB.
+                    image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    processed_frames_count += 1
+                    width = image.shape[1]
+                    height = image.shape[0]
+                    # [landmarks, info], with info->x_center ,y_center, r, g, b
+                    ldmks = np.zeros((468, 5), dtype=np.float32)
+                    ldmks[:, 0] = -1.0
+                    ldmks[:, 1] = -1.0
+                    ### face landmarks ###
+                    results = face_mesh.process(image)
+                    if results.multi_face_landmarks:
+                        face_landmarks = results.multi_face_landmarks[0]
+                        landmarks = [l for l in face_landmarks.landmark]
+                        for idx in range(len(landmarks)):
+                            landmark = landmarks[idx]
+                            if _landmark_is_valid(landmark):
+                                coords = _normalized_to_pixel_coordinates(
+                                    landmark.x, landmark.y, width, height)
+                                if coords:
+                                    ldmks[idx, 0] = coords[1]
+                                    ldmks[idx, 1] = coords[0]
+                        ### skin extraction ###
+                        cropped_skin_im, full_skin_im = skin_ex.extract_skin(
+                            image, ldmks)
+                    else:
+                        cropped_skin_im = np.zeros_like(image)
+                        full_skin_im = np.zeros_like(image)
+                    if self.visualize_skin == True:
+                        self.visualize_skin_collection.append(full_skin_im)
+                    ### sig computing ###
+                    sig.append(holistic_mean(
+                        cropped_skin_im, np.int32(SignalProcessingParams.RGB_LOW_TH), np.int32(SignalProcessingParams.RGB_HIGH_TH)))
+                    ### loop break ###
+                    if self.tot_frames is not None and self.tot_frames > 0 and processed_frames_count >= self.tot_frames:
+                        break
         sig = np.array(sig, dtype=np.float32)
         return sig
 
