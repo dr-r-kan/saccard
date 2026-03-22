@@ -1,13 +1,14 @@
+import os
+import requests
 import pyVHR
 import numpy as np
 import tensorflow as tf
 from .MTTS_CAN.model import Attention_mask, MTTS_CAN
 from scipy.signal import butter
+import scipy.signal
 import cv2
 from skimage.util import img_as_float
-import scipy.io
 from scipy.sparse import spdiags
-import h5py
 
 def preprocess_raw_video(frames, fs=30, dim=36):
   """A slightly different version from the original: 

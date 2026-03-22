@@ -1,4 +1,9 @@
-import cupy
+try:
+    import cupy
+    _cupy_available = True
+except ImportError:
+    cupy = None
+    _cupy_available = False
 import math
 import time
 import numpy as np
