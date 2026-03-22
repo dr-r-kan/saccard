@@ -1,6 +1,5 @@
 import setuptools
 import os
-from shutil import copyfile
 
 requirementPath = 'requirements.txt'
 reqs = []
@@ -12,22 +11,22 @@ with open("README.md", "r") as fh:
     long_description = fh.read()
 
 setuptools.setup(
-    name="pyVHR",
-    version="2.0",
-    author="Vittorio Cuculo <vittorio.cuculo@unimi.it>, Donatello Conte <donatello.conte@univ-tours.fr>, Alessandro D'Amelio <alessandro.damelio@unimi.it>, Giuliano Grossi <giuliano.grossi@unimi.it>, Edoardo Mortara <edoardo.mortara@studenti.unimi.it>",
+    name="saccard",
+    version="1.0",
+    author="dr-r-kan",
     author_email="",
-    description="Package for rPPG methods",
+    description="Remote cardiac data extraction from video using rPPG methods",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/phuselab/pyVHR",
+    url="https://github.com/dr-r-kan/saccard",
     packages=setuptools.find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",
-        "License :: OSI Approved :: BSD License",
+        "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
         "Operating System :: OS Independent",
     ],
     package_data={"": ['*.pth', '*.png', '*.hdf5']},
-    include_package_data = True,
-    python_requires='>=3.6',
+    include_package_data=True,
+    python_requires='>=3.8',
     install_requires=reqs,
 )
