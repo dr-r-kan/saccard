@@ -37,10 +37,14 @@ conda env create --file https://raw.githubusercontent.com/phuselab/pyVHR/pyVHR_C
 
 **CPU+GPU version** (v. 2.0 - current version)
 
-This yml environment is for cudatoolkit=11.3 and python=3.9.
+This yml environment targets **Python 3.10**, **CUDA 12.1**, **PyTorch 2.1**, and **MediaPipe 0.10**.
+It requires an NVIDIA GPU with a driver that supports CUDA 12.x (driver ≥ 525).
+
 ```bash
 conda env create --file https://raw.githubusercontent.com/phuselab/pyVHR/master/pyVHR_env.yml
 ```
+
+> **Note:** The environment uses the `pytorch` and `nvidia` conda channels to install PyTorch 2.1 with CUDA 12.1 support, and `conda-forge` for CuPy 13 (also CUDA 12 compatible). `cusignal` has been replaced by `cupyx.scipy.signal` (bundled with CuPy ≥ 13).
 
 ### Installation
 
@@ -57,6 +61,30 @@ conda activate pyvhr
 conda activate pyvhr
 (pyvhr) pip install pyvhr
 ```
+
+### Custom installation (CUDA 12)
+
+If you want to create your environment from scratch targeting CUDA 12, follow these steps:
+
+1. **Install PyTorch 2.x with CUDA 12.1** ([pytorch.org](https://pytorch.org/)):
+   ```bash
+   conda install pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia
+   ```
+
+2. **Install CuPy for CUDA 12** ([cupy.dev](https://docs.cupy.dev/en/stable/install.html)):
+   ```bash
+   conda install cupy=13 -c conda-forge
+   ```
+   > `cupyx.scipy.signal` (bundled with CuPy) replaces the legacy `cusignal` package.
+
+3. **Install MediaPipe 0.10** ([mediapipe.dev](https://developers.google.com/mediapipe)):
+   ```bash
+   pip install mediapipe==0.10.14
+   ```
+
+4. **Install remaining pip dependencies** as listed in `pyVHR_env.yml`.
+
+5. **Install pyVHR** as shown above.
 
 ## Basic usage
 Run the following code to obtain BPM estimates over time for a single video:
@@ -124,10 +152,9 @@ The `main` branch refers to the full pyVHR framework (requires GPU), while the `
 
 ### Custom installation
 If you want to create your environment from scratch you should follow these steps:
-- Install PyTorch ([here](https://pytorch.org/))
+- Install PyTorch 2.x with CUDA 12.1 ([here](https://pytorch.org/))
 - Install Numba ([here](https://numba.pydata.org/numba-doc/latest/user/installing.html))
-- Install Cupy (for GPU only) with the correct CUDA version ([here](https://docs.cupy.dev/en/stable/install.html#installing-cupy))
-- Install CuSignal (for GPU only) using conda and remove from the command 'cudatoolkit=x.y' ([here](https://github.com/rapidsai/cusignal))
+- Install CuPy 13 for CUDA 12 (for GPU only) ([here](https://docs.cupy.dev/en/stable/install.html#installing-cupy))
 - Install Kaleido ([here](https://pypi.org/project/kaleido/))
 - Install PyTables ([here](https://anaconda.org/anaconda/pytables))
 - Install pyVHR as shown above.

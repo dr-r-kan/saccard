@@ -7,7 +7,7 @@ from lmfit import Model
 from scipy.stats import iqr
 import numpy as np
 from scipy.signal import welch
-import cusignal
+import cupyx.scipy.signal
 import cupy
 
 def Welch(bvps, fps, minHz=0.65, maxHz=4.0, nfft=2048):
@@ -61,7 +61,7 @@ def Welch_cuda(bvps, fps, minHz=0.65, maxHz=4.0, nfft=2048):
         seglength = 256
         overlap = 200
     # -- periodogram by Welch
-    F, P = cusignal.welch(bvps, nperseg=seglength,
+    F, P = cupyx.scipy.signal.welch(bvps, nperseg=seglength,
                             noverlap=overlap, fs=fps, nfft=nfft)
     # -- freq subband (0.65 Hz - 4.0 Hz)
     band = cupy.argwhere((F > minHz) & (F < maxHz)).flatten()
