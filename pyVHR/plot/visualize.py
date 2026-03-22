@@ -11,7 +11,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import pyVHR
-from pyVHR.extraction.sig_processing import extract_frames_yield
+from pyVHR.extraction.sig_processing import extract_frames_yield, _normalized_to_pixel_coordinates, _landmark_is_valid
 from scipy.signal import welch
 import random
 
@@ -228,13 +228,10 @@ def visualize_landmarks_list(image_file_name=None, landmarks_list=None):
         landmarks_list (list): list of positive integers between 0 and 467 that identify patches centers (landmarks).
     
     """
-    PRESENCE_THRESHOLD = 0.5
-    VISIBILITY_THRESHOLD = 0.5
     if image_file_name is None:
         image_file_name = pyVHR.__path__[0] + '/../img/face.png' 
     imag = cv2.imread(image_file_name, cv2.COLOR_RGB2BGR)
     imag = cv2.cvtColor(imag, cv2.COLOR_BGR2RGB)
-    mp_drawing = mp.solutions.drawing_utils
     mp_face_mesh = mp.solutions.face_mesh
     with mp_face_mesh.FaceMesh(
             static_image_mode=True,
@@ -249,13 +246,12 @@ def visualize_landmarks_list(image_file_name=None, landmarks_list=None):
         face_landmarks = results.multi_face_landmarks[0]
         ldmks = np.zeros((468, 3), dtype=np.float32)
         for idx, landmark in enumerate(face_landmarks.landmark):
-            if ((landmark.HasField('visibility') and landmark.visibility < VISIBILITY_THRESHOLD)
-                    or (landmark.HasField('presence') and landmark.presence < PRESENCE_THRESHOLD)):
+            if not _landmark_is_valid(landmark):
                 ldmks[idx, 0] = -1.0
                 ldmks[idx, 1] = -1.0
                 ldmks[idx, 2] = -1.0
             else:
-                coords = mp_drawing._normalized_to_pixel_coordinates(
+                coords = _normalized_to_pixel_coordinates(
                     landmark.x, landmark.y, width, height)
                 if coords:
                     ldmks[idx, 0] = coords[0]

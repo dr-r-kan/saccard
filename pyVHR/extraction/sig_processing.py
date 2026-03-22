@@ -1,4 +1,5 @@
 import cv2
+import math
 import mediapipe as mp
 import numpy as np
 from pyVHR.extraction.utils import *
@@ -9,6 +10,29 @@ from pyVHR.utils.cuda_utils import *
 """
 This module defines classes or methods used for Signal extraction and processing.
 """
+
+def _normalized_to_pixel_coordinates(normalized_x, normalized_y, image_width, image_height):
+    """Convert normalized landmark coordinates to pixel coordinates."""
+    def is_valid(value):
+        return (value >= 0) and (value <= 1)
+    if not (is_valid(normalized_x) and is_valid(normalized_y)):
+        return None
+    x_px = min(int(math.floor(normalized_x * image_width)), image_width - 1)
+    y_px = min(int(math.floor(normalized_y * image_height)), image_height - 1)
+    return x_px, y_px
+
+def _landmark_is_valid(landmark, visibility_threshold=0.5, presence_threshold=0.5):
+    """Check if a mediapipe landmark meets visibility and presence thresholds."""
+    try:
+        # HasField raises ValueError for non-optional proto3 scalar fields;
+        # in proto3_optional fields (as used by MediaPipe), it works as expected.
+        if landmark.HasField('visibility') and landmark.visibility < visibility_threshold:
+            return False
+        if landmark.HasField('presence') and landmark.presence < presence_threshold:
+            return False
+    except ValueError:
+        pass
+    return True
 
 class SignalProcessing():
     """
@@ -148,10 +172,7 @@ class SignalProcessing():
 
         skin_ex = self.skin_extractor
 
-        mp_drawing = mp.solutions.drawing_utils
         mp_face_mesh = mp.solutions.face_mesh
-        PRESENCE_THRESHOLD = 0.5
-        VISIBILITY_THRESHOLD = 0.5
 
         sig = []
         processed_frames_count = 0
@@ -177,9 +198,8 @@ class SignalProcessing():
                     landmarks = [l for l in face_landmarks.landmark]
                     for idx in range(len(landmarks)):
                         landmark = landmarks[idx]
-                        if not ((landmark.HasField('visibility') and landmark.visibility < VISIBILITY_THRESHOLD)
-                                or (landmark.HasField('presence') and landmark.presence < PRESENCE_THRESHOLD)):
-                            coords = mp_drawing._normalized_to_pixel_coordinates(
+                        if _landmark_is_valid(landmark):
+                            coords = _normalized_to_pixel_coordinates(
                                 landmark.x, landmark.y, width, height)
                             if coords:
                                 ldmks[idx, 0] = coords[1]
@@ -215,10 +235,7 @@ class SignalProcessing():
 
         skin_ex = self.skin_extractor
 
-        mp_drawing = mp.solutions.drawing_utils
         mp_face_mesh = mp.solutions.face_mesh
-        PRESENCE_THRESHOLD = 0.5
-        VISIBILITY_THRESHOLD = 0.5
 
         sig = []
         processed_frames_count = 0
@@ -244,9 +261,8 @@ class SignalProcessing():
                     landmarks = [l for l in face_landmarks.landmark]
                     for idx in range(len(landmarks)):
                         landmark = landmarks[idx]
-                        if not ((landmark.HasField('visibility') and landmark.visibility < VISIBILITY_THRESHOLD)
-                                or (landmark.HasField('presence') and landmark.presence < PRESENCE_THRESHOLD)):
-                            coords = mp_drawing._normalized_to_pixel_coordinates(
+                        if _landmark_is_valid(landmark):
+                            coords = _normalized_to_pixel_coordinates(
                                 landmark.x, landmark.y, width, height)
                             if coords:
                                 ldmks[idx, 0] = coords[1]
@@ -359,10 +375,7 @@ class SignalProcessing():
 
         skin_ex = self.skin_extractor
 
-        mp_drawing = mp.solutions.drawing_utils
         mp_face_mesh = mp.solutions.face_mesh
-        PRESENCE_THRESHOLD = 0.5
-        VISIBILITY_THRESHOLD = 0.5
 
         sig = []
         processed_frames_count = 0
@@ -390,9 +403,8 @@ class SignalProcessing():
                     landmarks = [l for l in face_landmarks.landmark]
                     for idx in range(len(landmarks)):
                         landmark = landmarks[idx]
-                        if not ((landmark.HasField('visibility') and landmark.visibility < VISIBILITY_THRESHOLD)
-                                or (landmark.HasField('presence') and landmark.presence < PRESENCE_THRESHOLD)):
-                            coords = mp_drawing._normalized_to_pixel_coordinates(
+                        if _landmark_is_valid(landmark):
+                            coords = _normalized_to_pixel_coordinates(
                                 landmark.x, landmark.y, width, height)
                             if coords:
                                 ldmks[idx, 0] = coords[1]
