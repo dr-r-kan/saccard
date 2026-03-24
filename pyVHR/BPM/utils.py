@@ -7,14 +7,12 @@ from lmfit import Model
 from scipy.stats import iqr
 import numpy as np
 from scipy.signal import welch
-try:
-    import cupyx.scipy.signal as _cupyx_signal
-    import cupy
-    _cupy_available = True
-except ImportError:
-    _cupyx_signal = None
-    cupy = None
-    _cupy_available = False
+import importlib
+import importlib.util
+
+_cupyx_signal = None
+cupy = None
+_cupy_available = False
 
 def Welch(bvps, fps, minHz=0.65, maxHz=4.0, nfft=2048):
     """

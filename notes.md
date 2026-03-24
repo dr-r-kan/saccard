@@ -1,0 +1,3 @@
+We need a running script which takes a folder of video files, performs analysis with saccardiac, and then compiles this into useful datastructures.
+
+It should then perform some kind of circular statistics linear mixed model to look for effects of the cardiac phase on blinks, and eye movements - taking participants as a null categorical variable as per a LMM. Generate meaningful plots (radar plots) as before, but improved.

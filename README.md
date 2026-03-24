@@ -1,12 +1,18 @@
 # saccard
 
-**saccard** extracts cardiac data (BVP signals, heart rate BPM, metadata, and plots) from a video file or live webcam stream using remote photoplethysmography (rPPG). It is a fork from pyVHR - with reduced cardiac complexity, and instead a focus on ocular behaviour.
+**saccard** is a project aiming to measure implicit interoceptive behaviour using passive video recordings of faces.
+
+It uses a very simplified fork of pyVHR(link) in order to extract cardiac data, and then opencv to measure blinks and eye movement.
+
+We then compile blink rate and eye movement from the video, and use circular statistics to determine the relative occurence per point in the cardiac cycle.
+
+
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
 ## Methods
 
-Nine classical rPPG methods are supported:
+Nine classical rPPG methods are supported, transposed from the original pyVHR package.
 
 | Method | Reference |
 |--------|-----------|
@@ -24,50 +30,30 @@ Plus the deep-learning method **`MTTS_CAN`** (Liu et al., 2020).
 
 ## Installation
 
-One-command reproducible GPU setup (Windows PowerShell):
+The default install path is CPU-first and should be the safest option on a fresh machine.
 
-```powershell
-./scripts/setup_gpu_env.ps1
-```
-
-Compatibility alias (same behavior):
-
-```powershell
-./scripts/setup_gpu_envs.ps1
-```
-
-If you want to rebuild from scratch:
-
-```powershell
-./scripts/setup_gpu_env.ps1 -Recreate
-```
-
-Manual equivalent:
-
+Clone the repository, then run:
 ```bash
-conda create -n saccard-gpu python=3.9 -y
-conda activate saccard-gpu
-
-# CUDA 12 compatible GPU stack (recommended, reproducible)
-conda install pytorch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 pytorch-cuda=12.1 -c pytorch -c nvidia -y
-
-# Project dependencies (excluding torch packages by design)
 pip install -r requirements.txt
-pip install -e .
 ```
 
-Verify GPU runtime:
+Optional installs:
 
+- GPU/CuPy acceleration for compatible CUDA 12 environments:
 ```bash
-python -c "import torch, cupy; print('torch', torch.__version__); print('torch_cuda', torch.cuda.is_available()); print('cupy_devices', cupy.cuda.runtime.getDeviceCount())"
+pip install -r requirements-gpu.txt
 ```
 
-Expected output includes `torch_cuda True` and `cupy_devices >= 1`.
+- Torch/torchvision for the optional face-parsing ROI path:
+```bash
+pip install -r requirements-faceparsing.txt
+```
 
-Important:
+Notes:
 
-- Do not run `pip install torch torchvision torchaudio` in this environment after the conda step above.
-- This project auto-selects GPU execution when CUDA backends are available.
+- The default pipeline does not require GPU packages.
+- GPU execution is enabled only when the environment is appropriate and CUDA is actually available.
+- You can force CPU mode even in a GPU-capable environment by setting `SACCARD_DISABLE_GPU=1`.
 
 ## Quick start
 
@@ -75,53 +61,37 @@ Important:
 from saccard import saccard
 
 # Process a video file (all methods, default settings)
-result = saccard('path/to/video.mp4')
+saccard('path/to/video.mp4')
 
-# Process a live webcam stream for 30 seconds
-result = saccard(0, stream_duration=30)
-
-# Use only specific methods
-result = saccard('video.mp4', methods=['cpu_CHROM', 'cpu_POS', 'MTTS_CAN'])
 ```
 
-## Return value
+You can also select a subset of the methods.
 
-`saccard()` returns a ``dict`` with the following keys:
+## CPU/GPU behavior
 
-| Key | Type | Description |
-|-----|------|-------------|
-| `'bvp'` | `dict[str, list]` | Windowed BVP signal arrays per method |
-| `'bpm'` | `dict[str, ndarray]` | Per-window heart rate (BPM) per method |
-| `'times'` | `ndarray` | Window-centre timestamps (seconds) |
-| `'fps'` | `float` | Video frame rate |
-| `'metadata'` | `dict` | `video`, `fps`, `width`, `height`, `total_frames`, `duration`, `methods` |
-| `'plot'` | `plotly.Figure` | BPM-over-time chart for all methods |
+- CPU is the default and fallback mode.
+- Classical `pyVHR` methods will use CUDA only if `cupy` is installed and a CUDA device is available.
+- Optional face-parsing code paths require `torch` and `torchvision`; they are not needed for the default convex-hull workflow.
 
-### Example
+## Performance defaults
 
-```python
-from saccard import saccard
+The pipeline now uses speed-oriented defaults tuned for longer recordings:
 
-result = saccard('video.mp4', winsize=10, methods=['cpu_CHROM', 'cpu_POS'])
+- FaceMesh landmark refresh stride defaults to `3` frames.
+- Eye face-detection refresh stride defaults to `5` frames.
 
-print(result['fps'])                      # e.g. 30.0
-print(result['metadata'])                 # dict of video info
-print(result['bpm']['cpu_CHROM'])         # BPM array, one value per window
-result['plot'].show()                     # open interactive Plotly chart
+These defaults improve throughput while preserving output compatibility.
+
+## Benchmarking
+
+Use the benchmark helper to record runtime, memory, and stage timings:
+
+```bash
+python benchmark_pipeline.py path/to/video.mp4 --label baseline
+python benchmark_pipeline.py path/to/video.mp4 --label optimized
 ```
 
-## Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `video` | — | Video file path (`str`) or webcam index (`int`) |
-| `winsize` | `10` | Analysis window size in seconds |
-| `methods` | all | List of method names to run |
-| `roi_method` | `'convexhull'` | Skin ROI: `'convexhull'` or `'faceparsing'` |
-| `pre_filt` | `False` | Bandpass-filter the RGB signal before BVP extraction |
-| `post_filt` | `True` | Bandpass-filter the BVP signal after extraction |
-| `stream_duration` | `30` | Seconds to capture when `video` is a webcam index |
-| `verb` | `False` | Print progress messages |
+Each run writes a JSON benchmark artifact to `outputs/`.
 
 ## License
 

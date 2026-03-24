@@ -1,16 +1,34 @@
 from numba import cuda, njit, prange
-import cupy
 import math
 import numpy as np
-import torchvision.transforms as transforms
-import torch
 from numba import prange, njit, cuda
-from pyVHR.resources.faceparsing.model import BiSeNet
 import os
 import pyVHR
 from scipy.spatial import ConvexHull
 from PIL import Image, ImageDraw
 import requests
+import importlib
+import importlib.util
+
+if importlib.util.find_spec("cupy") is None:
+    cupy = None
+else:
+    cupy = importlib.import_module("cupy")
+
+if importlib.util.find_spec("torch") is None:
+    torch = None
+else:
+    torch = importlib.import_module("torch")
+
+if importlib.util.find_spec("torchvision") is None:
+    transforms = None
+else:
+    transforms = importlib.import_module("torchvision.transforms")
+
+if torch is None or transforms is None or importlib.util.find_spec("pyVHR.resources.faceparsing.model") is None:
+    BiSeNet = None
+else:
+    from pyVHR.resources.faceparsing.model import BiSeNet
 
 """
 This module defines classes or methods used for skin extraction.
@@ -81,6 +99,12 @@ class SkinExtractionFaceParsing():
         Args:
             device (str): This class can execute code on 'CPU' or 'GPU'.
         """
+        if transforms is None or torch is None or BiSeNet is None:
+            raise ModuleNotFoundError(
+                "torch, torchvision, and face-parsing dependencies are required for "
+                "SkinExtractionFaceParsing. Install them or switch ROI method to "
+                "convexhull/patches."
+            )
         self.device = device
         n_classes = 19
         self.net = BiSeNet(n_classes=n_classes)

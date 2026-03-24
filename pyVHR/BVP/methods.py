@@ -1,16 +1,19 @@
-try:
-    import cupy
-    _cupy_available = True
-except ImportError:
-    cupy = None
-    _cupy_available = False
+import importlib
+import importlib.util
+
+cupy = None
+_cupy_available = False
 import math
 import time
 import numpy as np
-import torch
 import os
 from sklearn.decomposition import PCA
 from pyVHR.BVP.utils import jadeR
+
+if importlib.util.find_spec("torch") is None:
+    torch = None
+else:
+    torch = importlib.import_module("torch")
 
 
 """

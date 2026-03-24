@@ -1,12 +1,15 @@
-try:
-    import cupy
-    _cupy_available = True
-except ImportError:
-    cupy = None
-    _cupy_available = False
+import importlib
+import importlib.util
+
+cupy = None
+_cupy_available = False
 import numpy as np
-import torch
 import sys
+
+if importlib.util.find_spec("torch") is None:
+    torch = None
+else:
+    torch = importlib.import_module("torch")
 
 """
 This module contains methods for trasforming an input signal
@@ -57,6 +60,8 @@ def signals_to_bvps_torch(sig, torch_method, params={}):
     Returns:
         float32 ndarray: BVP signal as float32 ndarray with shape [num_estimators, num_frames].
     """
+    if torch is None:
+        raise ModuleNotFoundError("torch is required for device_type='torch'")
     if sig.shape[0] == 0:
         return np.zeros((0, sig.shape[2]), dtype=sig.dtype)
     cpu_sig = torch.from_numpy(sig)
@@ -168,11 +173,7 @@ def concatenate_BVPs(list_of_BVPs):
         if first_window_len != len(item):
             return 0
 
-    try:
-        concatenated_BVPs = []
-        for i in range(first_window_len):
-            concatenated_BVPs.append(np.concatenate(tuple([e[i] for e in list_of_BVPs]), axis=0))
-        return concatenated_BVPs
-    except ValueError as e:
-        print(e)
-        return 0
+    concatenated_BVPs = []
+    for i in range(first_window_len):
+        concatenated_BVPs.append(np.concatenate(tuple([e[i] for e in list_of_BVPs]), axis=0))
+    return concatenated_BVPs

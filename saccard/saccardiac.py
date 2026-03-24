@@ -17,7 +17,11 @@ import logging
 import math
 import multiprocessing as mp
 import os
+import pickle
 import site
+import tempfile
+import time
+import traceback
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
@@ -26,7 +30,6 @@ import cv2
 import numpy as np
 import pandas as pd
 import sys
-import traceback
 import faulthandler
 
 from tqdm import tqdm
@@ -52,10 +55,80 @@ def _log_uncaught_exceptions(exc_type, exc_value, exc_tb):
     logger.exception("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
 
 sys.excepthook = _log_uncaught_exceptions
-try:
-    faulthandler.enable()
-except Exception:
-    pass
+faulthandler.enable()
+
+
+def _trace(msg: str) -> None:
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except OSError:
+        try:
+            print(msg, flush=True)
+        except OSError:
+            pass
+
+
+def _make_tqdm(*args: Any, **kwargs: Any):
+    if not TQDM_AVAILABLE:
+        return None
+    try:
+        return tqdm(*args, **kwargs)
+    except Exception:
+        return None
+
+
+def _join_process_with_progress(
+    proc: mp.Process,
+    timeout_s: float,
+    desc: str,
+    enabled: bool,
+) -> None:
+    if timeout_s <= 0:
+        proc.join()
+        return
+    if not enabled:
+        proc.join(timeout_s)
+        return
+
+    pbar = _make_tqdm(total=None, desc=desc, unit="s", leave=False)
+    started = time.perf_counter()
+    last_elapsed = 0.0
+    try:
+        while proc.is_alive():
+            elapsed = time.perf_counter() - started
+            delta = elapsed - last_elapsed
+            if pbar is not None and delta > 0:
+                pbar.update(delta)
+                last_elapsed += delta
+                pbar.set_postfix_str(f"elapsed={elapsed:.1f}s timeout={timeout_s:.1f}s")
+            if elapsed >= timeout_s:
+                break
+            proc.join(timeout=min(0.25, max(timeout_s - elapsed, 0.0)))
+        if pbar is not None and not proc.is_alive():
+            elapsed = time.perf_counter() - started
+            delta = elapsed - last_elapsed
+            if delta > 0:
+                pbar.update(delta)
+            pbar.set_postfix_str(f"elapsed={elapsed:.1f}s complete")
+    finally:
+        if pbar is not None:
+            pbar.close()
+
+
+def _make_isolated_payload_path(prefix: str = "saccard_pyvhr_", suffix: str = ".pkl") -> str:
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix)
+    os.close(fd)
+    return path
+
+
+def _write_isolated_payload(path: str, payload: Any) -> None:
+    with open(path, "wb") as fh:
+        pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _read_isolated_payload(path: str) -> Any:
+    with open(path, "rb") as fh:
+        return pickle.load(fh)
 
 
 @dataclass
@@ -81,9 +154,14 @@ class MultimodalExtractionConfig:
     rppg_estimate_type: str = "clustering"
     heart_band_hz: Tuple[float, float] = (0.7, 3.5)
     face_margin_px: int = 10
+    face_detection_refresh_stride: int = 5
+    preprocess_face_video: bool = True
+    preprocess_face_scale: float = 1.8
+    preprocess_output_size: int = 256
+    preprocess_keep_video: bool = False
     cardiac_backend: str = "pyvhr"
-    isolate_pyvhr: bool = False
-    pyvhr_timeout_s: float = 120.0
+    isolate_pyvhr: bool = True
+    pyvhr_timeout_s: float = 6000.0
     pyvhr_preflight_timeout_s: float = 30.0
     pyvhr_preflight_isolated: bool = True
     pyvhr_consensus_strategy: str = "promac"
@@ -93,6 +171,8 @@ class MultimodalExtractionConfig:
     pyvhr_drop_failed_methods: bool = True
     pyvhr_patch_size: int = 0
     pyvhr_rgb_low_high_th: Tuple[int, int] = (5, 230)
+    holistic_downsample_scale: float = 1.0
+    holistic_landmark_refresh_stride: int = 3
 
     eye_confidence_threshold: float = 0.5
     eye_smoothing_window: int = 5
@@ -128,10 +208,8 @@ class LiveMetrics:
 
 
 def _safe_float(value: Any, default: float = math.nan) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+    out = pd.to_numeric(value, errors="coerce")
+    return float(out) if np.isfinite(out) else default
 
 
 def _moving_average_nan(values: np.ndarray, window: int) -> np.ndarray:
@@ -499,6 +577,248 @@ def _detect_face_roi(frame_bgr: np.ndarray, margin_px: int) -> Optional[Tuple[in
     return x0, y0, x1, y1
 
 
+def _clip_box_to_frame(
+    box: Tuple[float, float, float, float],
+    frame_shape: Tuple[int, int],
+) -> Tuple[int, int, int, int]:
+    h, w = frame_shape[:2]
+    x0, y0, x1, y1 = box
+    x0 = int(np.clip(round(x0), 0, max(w - 1, 0)))
+    y0 = int(np.clip(round(y0), 0, max(h - 1, 0)))
+    x1 = int(np.clip(round(x1), x0 + 1, w))
+    y1 = int(np.clip(round(y1), y0 + 1, h))
+    return x0, y0, x1, y1
+
+
+def _face_box_to_tracker_rect(face_rect: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+    x0, y0, x1, y1 = face_rect
+    return int(x0), int(y0), int(max(x1 - x0, 1)), int(max(y1 - y0, 1))
+
+
+def _tracker_rect_to_face_box(tracker_rect: Tuple[float, float, float, float]) -> Tuple[int, int, int, int]:
+    x, y, w, h = tracker_rect
+    return int(round(x)), int(round(y)), int(round(x + w)), int(round(y + h))
+
+
+def _make_opencv_tracker() -> Any:
+    constructors = [
+        getattr(cv2, "TrackerMOSSE_create", None),
+        getattr(cv2, "TrackerKCF_create", None),
+        getattr(cv2, "TrackerCSRT_create", None),
+    ]
+    legacy = getattr(cv2, "legacy", None)
+    if legacy is not None:
+        constructors.extend(
+            [
+                getattr(legacy, "TrackerMOSSE_create", None),
+                getattr(legacy, "TrackerKCF_create", None),
+                getattr(legacy, "TrackerCSRT_create", None),
+            ]
+        )
+    for constructor in constructors:
+        if callable(constructor):
+            try:
+                return constructor()
+            except Exception:
+                continue
+    return None
+
+
+class FacePreprocessor:
+    def __init__(self, config: MultimodalExtractionConfig):
+        self.config = config
+        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+    def _detect_face(self, frame_bgr: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        max_side = max(gray.shape[:2])
+        detect_scale = min(1.0, 320.0 / max(max_side, 1))
+        if detect_scale < 1.0:
+            detect_gray = cv2.resize(gray, None, fx=detect_scale, fy=detect_scale, interpolation=cv2.INTER_AREA)
+        else:
+            detect_gray = gray
+        min_size = max(24, int(round(80 * detect_scale)))
+        faces = self.face_cascade.detectMultiScale(
+            detect_gray,
+            scaleFactor=1.1,
+            minNeighbors=4,
+            minSize=(min_size, min_size),
+        )
+        if len(faces) == 0:
+            return None
+        x, y, w, h = max(faces, key=lambda rect: rect[2] * rect[3])
+        if detect_scale < 1.0:
+            inv = 1.0 / detect_scale
+            x = int(round(x * inv))
+            y = int(round(y * inv))
+            w = int(round(w * inv))
+            h = int(round(h * inv))
+        return _clip_box_to_frame(
+            (
+                x - self.config.face_margin_px,
+                y - self.config.face_margin_px,
+                x + w + self.config.face_margin_px,
+                y + h + self.config.face_margin_px,
+            ),
+            frame_bgr.shape[:2],
+        )
+
+    def _track_face_boxes(self, video_path: str) -> Tuple[List[Optional[Tuple[int, int, int, int]]], float, Tuple[int, int]]:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise IOError(f"Cannot open video: {video_path}")
+        fps = _safe_float(cap.get(cv2.CAP_PROP_FPS))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        stride = max(1, int(self.config.face_detection_refresh_stride))
+        boxes: List[Optional[Tuple[int, int, int, int]]] = []
+        tracker = None
+        tracker_refresh_stride = max(stride * 3, 15)
+        pbar = _make_tqdm(total=total_frames, desc="Face isolate detect", unit="fr") if self.config.verbose and total_frames > 0 else None
+        frame_idx = 0
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                if self.config.max_frames is not None and frame_idx >= self.config.max_frames:
+                    break
+                face_rect: Optional[Tuple[int, int, int, int]] = None
+                if tracker is not None:
+                    try:
+                        ok_track, tracker_rect = tracker.update(frame)
+                    except Exception:
+                        ok_track, tracker_rect = False, None
+                    if ok_track and tracker_rect is not None:
+                        face_rect = _clip_box_to_frame(_tracker_rect_to_face_box(tracker_rect), frame.shape[:2])
+                if face_rect is None or frame_idx % tracker_refresh_stride == 0:
+                    detected = self._detect_face(frame)
+                    if detected is not None:
+                        face_rect = detected
+                        tracker = _make_opencv_tracker()
+                        if tracker is not None:
+                            try:
+                                tracker.init(frame, _face_box_to_tracker_rect(face_rect))
+                            except Exception:
+                                tracker = None
+                boxes.append(face_rect)
+                frame_idx += 1
+                if pbar is not None:
+                    pbar.update(1)
+        finally:
+            cap.release()
+            if pbar is not None:
+                pbar.close()
+        return boxes, fps, (height, width)
+
+    def _smooth_boxes(
+        self,
+        boxes: List[Optional[Tuple[int, int, int, int]]],
+        frame_shape: Tuple[int, int],
+    ) -> List[Tuple[int, int, int, int]]:
+        if not boxes:
+            return []
+        rows: List[Tuple[float, float, float, float]] = []
+        for box in boxes:
+            if box is None:
+                rows.append((math.nan, math.nan, math.nan, math.nan))
+            else:
+                x0, y0, x1, y1 = box
+                rows.append((float(x0), float(y0), float(x1), float(y1)))
+        df = pd.DataFrame(rows, columns=["x0", "y0", "x1", "y1"])
+        df = df.interpolate(limit_direction="both")
+        df = df.rolling(window=7, center=True, min_periods=1).mean()
+        if df.isna().any().any():
+            h, w = frame_shape
+            fallback = pd.Series({"x0": w * 0.2, "y0": h * 0.1, "x1": w * 0.8, "y1": h * 0.9})
+            df = df.fillna(fallback)
+        return [
+            _clip_box_to_frame(tuple(row), frame_shape)
+            for row in df[["x0", "y0", "x1", "y1"]].itertuples(index=False, name=None)
+        ]
+
+    def _crop_box(self, face_box: Tuple[int, int, int, int], frame_shape: Tuple[int, int]) -> Tuple[int, int, int, int]:
+        h, w = frame_shape
+        x0, y0, x1, y1 = face_box
+        cx = 0.5 * (x0 + x1)
+        cy = 0.5 * (y0 + y1)
+        face_w = max(x1 - x0, 1)
+        face_h = max(y1 - y0, 1)
+        side = max(face_w, face_h) * float(self.config.preprocess_face_scale)
+        side = max(side, 64.0)
+        half = side / 2.0
+        return _clip_box_to_frame((cx - half, cy - half, cx + half, cy + half), (h, w))
+
+    def preprocess(self, video_path: str) -> Tuple[str, Dict[str, Any]]:
+        boxes, fps, frame_shape = self._track_face_boxes(video_path)
+        smoothed_boxes = self._smooth_boxes(boxes, frame_shape)
+        if not smoothed_boxes:
+            return video_path, {"enabled": False, "reason": "no_frames"}
+
+        source = Path(video_path)
+        output_dir = Path(self.config.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if self.config.preprocess_keep_video:
+            output_path = output_dir / f"{source.stem}_facecrop.mp4"
+        else:
+            handle = tempfile.NamedTemporaryFile(
+                prefix=f"{source.stem}_facecrop_",
+                suffix=".mp4",
+                delete=False,
+                dir=str(output_dir),
+            )
+            handle.close()
+            output_path = Path(handle.name)
+
+        output_size = int(max(64, self.config.preprocess_output_size))
+        writer = cv2.VideoWriter(
+            str(output_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps if np.isfinite(fps) and fps > 0 else 30.0,
+            (output_size, output_size),
+        )
+        if not writer.isOpened():
+            raise RuntimeError(f"Could not create preprocessed video: {output_path}")
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            writer.release()
+            raise IOError(f"Cannot reopen video: {video_path}")
+        pbar = _make_tqdm(total=len(smoothed_boxes), desc="Face isolate write", unit="fr") if self.config.verbose else None
+        try:
+            for frame_idx, face_box in enumerate(smoothed_boxes):
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                if self.config.max_frames is not None and frame_idx >= self.config.max_frames:
+                    break
+                x0, y0, x1, y1 = self._crop_box(face_box, frame.shape[:2])
+                cropped = frame[y0:y1, x0:x1]
+                if cropped.size == 0:
+                    cropped = frame
+                resized = cv2.resize(cropped, (output_size, output_size), interpolation=cv2.INTER_LINEAR)
+                writer.write(resized)
+                if pbar is not None:
+                    pbar.update(1)
+        finally:
+            cap.release()
+            writer.release()
+            if pbar is not None:
+                pbar.close()
+
+        return str(output_path), {
+            "enabled": True,
+            "source_video": str(video_path),
+            "processed_video": str(output_path),
+            "output_size": int(output_size),
+            "face_scale": float(self.config.preprocess_face_scale),
+            "frames_processed": int(len(smoothed_boxes)),
+            "fps": float(fps) if np.isfinite(fps) else math.nan,
+            "keep_video": bool(self.config.preprocess_keep_video),
+        }
+
+
 def _default_eye_regions(frame_shape: Tuple[int, int], face_rect: Optional[Tuple[int, int, int, int]]) -> Tuple[List[np.ndarray], np.ndarray]:
     h, w = frame_shape
     if face_rect is not None:
@@ -584,6 +904,79 @@ def _resample_numeric_to_grid(source_times: np.ndarray, values: np.ndarray, targ
     return _interp1d_eval(source_times, values, target_times, kind="linear", fill_value=np.nan)
 
 
+def _window_bvp_to_1d(window_bvp: Any) -> np.ndarray:
+    signal_1d = _signal_to_1d_array(window_bvp)
+    finite = np.isfinite(signal_1d)
+    if not np.any(finite):
+        return np.array([], dtype=float)
+    centered = signal_1d.copy()
+    centered[~finite] = np.nanmedian(centered[finite])
+    centered = _detrend(centered)
+    scale = float(np.nanstd(centered))
+    if np.isfinite(scale) and scale > 0:
+        centered = centered / scale
+    return centered.astype(float)
+
+
+def _window_center_to_bounds(center_s: float, n_samples: int, fps: float) -> Tuple[int, int]:
+    center_idx = int(round(float(center_s) * float(fps)))
+    start = int(round(center_idx - n_samples / 2.0))
+    end = start + int(n_samples)
+    return start, end
+
+
+def _reconstruct_bvp_from_windows(
+    window_bvps: Any,
+    window_times: np.ndarray,
+    fps: float,
+    total_frames: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    windows = list(window_bvps or [])
+    if not windows:
+        return np.array([], dtype=float), np.array([], dtype=float)
+
+    parsed_windows: List[Tuple[int, int, np.ndarray]] = []
+    max_end = 0
+    for center_s, window_bvp in zip(np.asarray(window_times, dtype=float), windows):
+        signal_1d = _window_bvp_to_1d(window_bvp)
+        if len(signal_1d) == 0:
+            continue
+        start, end = _window_center_to_bounds(center_s, len(signal_1d), fps)
+        parsed_windows.append((start, end, signal_1d))
+        max_end = max(max_end, end)
+
+    if not parsed_windows:
+        return np.array([], dtype=float), np.array([], dtype=float)
+
+    n_samples = int(max(total_frames, max_end, max(len(sig) for _, _, sig in parsed_windows)))
+    accum = np.zeros(n_samples, dtype=float)
+    weight = np.zeros(n_samples, dtype=float)
+
+    for start, end, signal_1d in parsed_windows:
+        src_lo = 0
+        src_hi = len(signal_1d)
+        dst_lo = start
+        dst_hi = end
+        if dst_lo < 0:
+            src_lo = -dst_lo
+            dst_lo = 0
+        if dst_hi > n_samples:
+            src_hi -= dst_hi - n_samples
+            dst_hi = n_samples
+        if dst_lo >= dst_hi or src_lo >= src_hi:
+            continue
+        segment = signal_1d[src_lo:src_hi]
+        taper = np.hanning(len(segment)) if len(segment) >= 8 else np.ones(len(segment), dtype=float)
+        taper = np.clip(taper, 1e-3, None)
+        accum[dst_lo:dst_hi] += segment * taper
+        weight[dst_lo:dst_hi] += taper
+
+    bvp = np.divide(accum, weight, out=np.full(n_samples, np.nan, dtype=float), where=weight > 0)
+    bvp = _interpolate_nan(bvp)
+    times = np.arange(n_samples, dtype=float) / float(fps)
+    return times, bvp
+
+
 def _synthesise_phase_from_bpm(times: np.ndarray, bpm: np.ndarray) -> np.ndarray:
     times = np.asarray(times, dtype=float)
     bpm = np.asarray(bpm, dtype=float)
@@ -620,10 +1013,7 @@ def _orient_bvp_signal(
     dt = np.diff(times[finite])
     fs = 1.0 / float(np.nanmedian(dt)) if len(dt) else math.nan
     if np.isfinite(fs) and fs > 2 * heart_band_hz[0]:
-        try:
-            sig = _bandpass_filter(sig, fs, heart_band_hz[0], heart_band_hz[1])
-        except Exception:
-            pass
+        sig = _bandpass_filter(sig, fs, heart_band_hz[0], heart_band_hz[1])
     hint = float(np.nanmedian(bpm_hint[np.isfinite(bpm_hint)])) if np.any(np.isfinite(bpm_hint)) else math.nan
 
     def evaluate(candidate: np.ndarray) -> Dict[str, Any]:
@@ -735,16 +1125,16 @@ def _parse_pyvhr_outputs(run_result: Any, fps: float, total_frames: int) -> Tupl
 
 
 def _run_single_pyvhr_method(video_path: str, config: MultimodalExtractionConfig, method: str, import_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    print(f"[TRACE] _run_single_pyvhr_method start method={method}", file=sys.stderr, flush=True)
+    _trace(f"[TRACE] _run_single_pyvhr_method start method={method}")
     _apply_import_context(import_context)
-    print(f"[TRACE] _run_single_pyvhr_method preflight import start method={method}", file=sys.stderr, flush=True)
+    _trace(f"[TRACE] _run_single_pyvhr_method preflight import start method={method}")
     preflight = _preflight_pyvhr_import(import_context)
-    print(f"[TRACE] _run_single_pyvhr_method preflight import done method={method}", file=sys.stderr, flush=True)
-    saccard_module = importlib.import_module("saccard")
+    _trace(f"[TRACE] _run_single_pyvhr_method preflight import done method={method}")
+    saccard_module = importlib.import_module("saccard.core")
     saccard_fn = getattr(saccard_module, "saccard", None)
     if saccard_fn is None:
         raise ImportError("Imported package 'saccard' but could not find callable 'saccard'")
-    print(f"[TRACE] _run_single_pyvhr_method imported saccard.saccard method={method}", file=sys.stderr, flush=True)
+    _trace(f"[TRACE] _run_single_pyvhr_method imported saccard.saccard method={method}")
 
     result = saccard_fn(
         video_path,
@@ -753,84 +1143,87 @@ def _run_single_pyvhr_method(video_path: str, config: MultimodalExtractionConfig
         roi_method="convexhull",
         pre_filt=True,
         post_filt=True,
+        max_frames=getattr(config, "max_frames", None),
+        holistic_downsample_scale=float(getattr(config, "holistic_downsample_scale", 1.0)),
+        holistic_landmark_refresh_stride=int(getattr(config, "holistic_landmark_refresh_stride", 3)),
         verb=config.verbose,
     )
-    print(f"[TRACE] _run_single_pyvhr_method saccard returned method={method}", file=sys.stderr, flush=True)
-
-    fps = _safe_float(result.get("fps"))
-    metadata = result.get("metadata", {}) if isinstance(result, dict) else {}
-    total_frames = int(metadata.get("total_frames") or 0)
-    times = np.asarray(result.get("times", []), dtype=float)
-    bpm = np.asarray(result.get("bpm", {}).get(method, []), dtype=float)
-    if len(times) == 0 or len(bpm) == 0:
-        raise RuntimeError(f"saccard() returned no cardiac samples for method {method}")
-    if len(bpm) != len(times):
-        bpm_time = np.linspace(times[0], times[-1], len(bpm)) if len(bpm) > 1 else np.asarray([times[0]], dtype=float)
-        bpm = _interp1d_eval(bpm_time, bpm, times, kind="linear", fill_value="extrapolate")
-
-    phase = _synthesise_phase_from_bpm(times, bpm)
-    bvp = np.sin(phase)
-    peak_times = np.array([], dtype=float)
-    peak_indices = np.array([], dtype=int)
-    finite_bpm = bpm[np.isfinite(bpm)]
-    median_bpm = float(np.nanmedian(finite_bpm)) if len(finite_bpm) else math.nan
-    quality = float(np.mean(np.isfinite(bpm))) if len(bpm) else 0.0
-    print(f"[TRACE] _run_single_pyvhr_method complete method={method} n={len(times)} median_bpm={median_bpm}", file=sys.stderr, flush=True)
-    return {
-        "method": method,
-        "times": times,
-        "bpm": bpm,
-        "bvp": bvp,
-        "phase": phase,
-        "peak_times": peak_times,
-        "peak_indices": peak_indices,
-        "sign": 1.0,
-        "median_bpm": float(median_bpm) if np.isfinite(median_bpm) else math.nan,
-        "quality": quality,
-        "fps": float(fps),
-        "total_frames": int(total_frames),
-        "import_diagnostics": preflight,
-    }
+    _trace(f"[TRACE] _run_single_pyvhr_method saccard returned method={method}")
+    payloads = _build_pyvhr_payloads_from_saccard_result(
+        result=result,
+        methods=[method],
+        import_diagnostics=preflight,
+        heart_band_hz=tuple(config.heart_band_hz),
+    )
+    payload = payloads[0]
+    _trace(
+        f"[TRACE] _run_single_pyvhr_method complete method={method} n={len(payload['times'])} "
+        f"median_bpm={payload.get('median_bpm', math.nan)}"
+    )
+    return payload
 
 
 def _build_pyvhr_payloads_from_saccard_result(
     result: Dict[str, Any],
     methods: Iterable[str],
     import_diagnostics: Dict[str, Any],
+    heart_band_hz: Tuple[float, float],
 ) -> List[Dict[str, Any]]:
-    times = np.asarray(result.get("times", []), dtype=float)
-    if len(times) == 0:
+    window_times = np.asarray(result.get("times", []), dtype=float)
+    if len(window_times) == 0:
         raise RuntimeError("saccard() returned no cardiac timestamps")
 
     fps = _safe_float(result.get("fps"))
     metadata = result.get("metadata", {}) if isinstance(result, dict) else {}
     total_frames = int(metadata.get("total_frames") or 0)
     bpm_dict = result.get("bpm", {}) if isinstance(result, dict) else {}
+    bvp_dict = result.get("bvp", {}) if isinstance(result, dict) else {}
 
     payloads: List[Dict[str, Any]] = []
     for method in methods:
-        bpm = np.asarray(bpm_dict.get(method, []), dtype=float)
-        if len(bpm) == 0:
+        bpm_windows = np.asarray(bpm_dict.get(method, []), dtype=float)
+        window_bvps = bvp_dict.get(method, [])
+        if len(bpm_windows) == 0 and not window_bvps:
             raise RuntimeError(f"saccard() returned no cardiac samples for method {method}")
-        if len(bpm) != len(times):
-            bpm_time = np.linspace(times[0], times[-1], len(bpm)) if len(bpm) > 1 else np.asarray([times[0]], dtype=float)
-            bpm = _interp1d_eval(bpm_time, bpm, times, kind="linear", fill_value="extrapolate")
+        times, reconstructed_bvp = _reconstruct_bvp_from_windows(window_bvps, window_times, fps, total_frames)
+        if len(times) == 0:
+            raise RuntimeError(f"Failed to reconstruct BVP for method {method}")
+        if len(bpm_windows) == 0:
+            bpm = np.full(len(times), np.nan, dtype=float)
+        else:
+            bpm = _interp1d_eval(window_times, bpm_windows, times, kind="linear", fill_value="extrapolate")
 
-        phase = _synthesise_phase_from_bpm(times, bpm)
-        bvp = np.sin(phase)
+        oriented = _orient_bvp_signal(
+            reconstructed_bvp,
+            times,
+            bpm,
+            heart_band_hz=heart_band_hz,
+        )
+        peak_times = np.asarray(oriented["peak_times"], dtype=float)
+        peak_indices = np.asarray(oriented["peaks"], dtype=int)
+        phase = _phase_from_peaks(times, peak_times)
+        finite_phase = np.isfinite(phase)
+        if not np.all(finite_phase):
+            fallback = _synthesise_phase_from_bpm(times, bpm)
+            phase = np.where(finite_phase, phase, fallback)
+
         finite_bpm = bpm[np.isfinite(bpm)]
-        median_bpm = float(np.nanmedian(finite_bpm)) if len(finite_bpm) else math.nan
-        quality = float(np.mean(np.isfinite(bpm))) if len(bpm) else 0.0
+        peak_quality = float(min(len(peak_times) / max(max(times[-1], 1.0), 1.0), 4.0) / 4.0) if len(times) else 0.0
+        coverage_quality = float(np.mean(np.isfinite(reconstructed_bvp))) if len(reconstructed_bvp) else 0.0
+        quality = max(1e-6, 0.5 * peak_quality + 0.5 * coverage_quality)
+        median_bpm = float(oriented.get("median_bpm", math.nan))
+        if not np.isfinite(median_bpm) and len(finite_bpm):
+            median_bpm = float(np.nanmedian(finite_bpm))
         payloads.append(
             {
                 "method": method,
-                "times": times.copy(),
+                "times": times,
                 "bpm": bpm,
-                "bvp": bvp,
+                "bvp": np.asarray(oriented["signal"], dtype=float),
                 "phase": phase,
-                "peak_times": np.array([], dtype=float),
-                "peak_indices": np.array([], dtype=int),
-                "sign": 1.0,
+                "peak_times": peak_times,
+                "peak_indices": peak_indices,
+                "sign": float(oriented.get("sign", 1.0)),
                 "median_bpm": float(median_bpm) if np.isfinite(median_bpm) else math.nan,
                 "quality": quality,
                 "fps": float(fps),
@@ -848,10 +1241,10 @@ def _run_pyvhr_method_batch(
     import_context: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     methods = _normalise_method_list(methods)
-    print(f"[TRACE] _run_pyvhr_method_batch start methods={methods}", file=sys.stderr, flush=True)
+    _trace(f"[TRACE] _run_pyvhr_method_batch start methods={methods}")
     _apply_import_context(import_context)
     preflight = _preflight_pyvhr_import(import_context)
-    saccard_module = importlib.import_module("saccard")
+    saccard_module = importlib.import_module("saccard.core")
     saccard_fn = getattr(saccard_module, "saccard", None)
     if saccard_fn is None:
         raise ImportError("Imported package 'saccard' but could not find callable 'saccard'")
@@ -862,27 +1255,18 @@ def _run_pyvhr_method_batch(
         roi_method="convexhull",
         pre_filt=True,
         post_filt=True,
+        max_frames=getattr(config, "max_frames", None),
+        holistic_downsample_scale=float(getattr(config, "holistic_downsample_scale", 1.0)),
+        holistic_landmark_refresh_stride=int(getattr(config, "holistic_landmark_refresh_stride", 3)),
         verb=config.verbose,
     )
-    print(f"[TRACE] _run_pyvhr_method_batch complete methods={methods}", file=sys.stderr, flush=True)
-    return _build_pyvhr_payloads_from_saccard_result(result, methods, preflight)
+    _trace(f"[TRACE] _run_pyvhr_method_batch complete methods={methods}")
+    return _build_pyvhr_payloads_from_saccard_result(result, methods, preflight, tuple(config.heart_band_hz))
 
 
 def _pyvhr_preflight_worker(queue: "mp.Queue", import_context: Optional[Dict[str, Any]] = None) -> None:
-    try:
-        payload = _preflight_pyvhr_import(import_context)
-        queue.put({"ok": True, "payload": payload})
-    except BaseException as exc:
-        tb = traceback.format_exc()
-        try:
-            queue.put({
-                "ok": False,
-                "error_type": type(exc).__name__,
-                "error": repr(exc),
-                "traceback": tb,
-            })
-        finally:
-            raise
+    payload = _preflight_pyvhr_import(import_context)
+    queue.put({"ok": True, "payload": payload})
 
 
 def _preflight_pyvhr_import_isolated(import_context: Optional[Dict[str, Any]], timeout_s: float) -> Dict[str, Any]:
@@ -892,7 +1276,7 @@ def _preflight_pyvhr_import_isolated(import_context: Optional[Dict[str, Any]], t
     proc = ctx.Process(target=_pyvhr_preflight_worker, args=(queue, import_context), daemon=True)
     proc.start()
     print(f"[TRACE] Spawned pyVHR preflight child pid={proc.pid} timeout_s={timeout_s}", file=sys.stderr, flush=True)
-    proc.join(timeout_s)
+    _join_process_with_progress(proc, timeout_s, desc="pyVHR import", enabled=True)
     if proc.is_alive():
         proc.terminate()
         proc.join(5.0)
@@ -910,40 +1294,50 @@ def _preflight_pyvhr_import_isolated(import_context: Optional[Dict[str, Any]], t
     raise RuntimeError(f"pyVHR import preflight failed with {payload.get('error_type', 'Exception')}: {payload.get('error', 'unknown error')}")
 
 
-def _pyvhr_method_worker(video_path: str, config: MultimodalExtractionConfig, method: str, queue: "mp.Queue", import_context: Optional[Dict[str, Any]] = None) -> None:
+def _pyvhr_method_worker(
+    video_path: str,
+    config: MultimodalExtractionConfig,
+    method: str,
+    queue: "mp.Queue",
+    payload_path: str,
+    import_context: Optional[Dict[str, Any]] = None,
+) -> None:
     try:
         payload = _run_single_pyvhr_method(video_path=video_path, config=config, method=method, import_context=import_context)
-        queue.put({"ok": True, "payload": payload})
-    except BaseException as exc:
-        tb = traceback.format_exc()
-        try:
-            queue.put({
+        _write_isolated_payload(payload_path, payload)
+        queue.put({"ok": True, "payload_path": payload_path})
+    except Exception as exc:
+        queue.put(
+            {
                 "ok": False,
+                "error": str(exc),
                 "error_type": type(exc).__name__,
-                "error": repr(exc),
-                "traceback": tb,
-                "method": method,
-            })
-        finally:
-            raise
+                "traceback": traceback.format_exc(),
+            }
+        )
 
 
-def _pyvhr_batch_worker(video_path: str, config: MultimodalExtractionConfig, methods: List[str], queue: "mp.Queue", import_context: Optional[Dict[str, Any]] = None) -> None:
+def _pyvhr_batch_worker(
+    video_path: str,
+    config: MultimodalExtractionConfig,
+    methods: List[str],
+    queue: "mp.Queue",
+    payload_path: str,
+    import_context: Optional[Dict[str, Any]] = None,
+) -> None:
     try:
         payload = _run_pyvhr_method_batch(video_path=video_path, config=config, methods=methods, import_context=import_context)
-        queue.put({"ok": True, "payload": payload})
-    except BaseException as exc:
-        tb = traceback.format_exc()
-        try:
-            queue.put({
+        _write_isolated_payload(payload_path, payload)
+        queue.put({"ok": True, "payload_path": payload_path})
+    except Exception as exc:
+        queue.put(
+            {
                 "ok": False,
+                "error": str(exc),
                 "error_type": type(exc).__name__,
-                "error": repr(exc),
-                "traceback": tb,
-                "methods": methods,
-            })
-        finally:
-            raise
+                "traceback": traceback.format_exc(),
+            }
+        )
 
 
 class CardiacPhaseExtractor:
@@ -965,25 +1359,55 @@ class CardiacPhaseExtractor:
         mp.set_executable(sys.executable)
         ctx = mp.get_context("spawn")
         queue: mp.Queue = ctx.Queue()
-        proc = ctx.Process(target=_pyvhr_batch_worker, args=(video_path, self.config, methods, queue, self._import_context), daemon=True)
+        payload_path = _make_isolated_payload_path()
+        proc = ctx.Process(
+            target=_pyvhr_batch_worker,
+            args=(video_path, self.config, methods, queue, payload_path, self._import_context),
+            daemon=True,
+        )
         proc.start()
         print(f"[TRACE] Spawned pyVHR child pid={proc.pid} methods={methods} timeout_s={timeout_s}", file=sys.stderr, flush=True)
-        proc.join(timeout_s)
-        if proc.is_alive():
-            proc.terminate()
-            proc.join(5.0)
-            raise RuntimeError(f"pyVHR methods {methods} timed out after {timeout_s:.1f} s")
-        payload = None
-        if not queue.empty():
-            payload = queue.get_nowait()
-        if payload is None:
-            raise RuntimeError(f"pyVHR methods {methods} exited without payload; exitcode={proc.exitcode}")
-        if payload.get("ok"):
-            return payload["payload"]
-        tb = payload.get("traceback", "")
-        if tb:
-            print(tb, file=sys.stderr, flush=True)
-        raise RuntimeError(f"pyVHR methods {methods} failed with {payload.get('error_type', 'Exception')}: {payload.get('error', 'unknown error')}")
+        method_label = ",".join(methods[:3]) + ("..." if len(methods) > 3 else "")
+        try:
+            _join_process_with_progress(
+                proc,
+                timeout_s,
+                desc=f"pyVHR extract [{method_label}]",
+                enabled=bool(self.config.verbose),
+            )
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(5.0)
+                raise RuntimeError(
+                    f"pyVHR methods {methods} timed out after {timeout_s:.1f} s. "
+                    "The child process was terminated to avoid a hung run. "
+                    "Increase --pyvhr-timeout-s for slow hardware/long videos or profile FaceMesh extraction settings."
+                )
+            payload = None
+            if not queue.empty():
+                payload = queue.get_nowait()
+            if payload is None:
+                raise RuntimeError(
+                    f"pyVHR methods {methods} exited without payload; exitcode={proc.exitcode}. "
+                    "Check child-process import/runtime errors and available memory."
+                )
+            if payload.get("ok"):
+                result_path = payload.get("payload_path")
+                if not result_path or not os.path.exists(result_path):
+                    raise RuntimeError(
+                        f"pyVHR methods {methods} completed but result payload was not written: {result_path!r}"
+                    )
+                return _read_isolated_payload(result_path)
+            tb = payload.get("traceback", "")
+            if tb:
+                print(tb, file=sys.stderr, flush=True)
+            raise RuntimeError(f"pyVHR methods {methods} failed with {payload.get('error_type', 'Exception')}: {payload.get('error', 'unknown error')}")
+        finally:
+            if os.path.exists(payload_path):
+                try:
+                    os.remove(payload_path)
+                except OSError:
+                    pass
 
     def _run_pyvhr_methods(self, video_path: str, methods: List[str]) -> List[Dict[str, Any]]:
         print(f"[TRACE] Running pyVHR methods in batch: {methods}", file=sys.stderr, flush=True)
@@ -997,25 +1421,10 @@ class CardiacPhaseExtractor:
         isolated_enabled = bool(getattr(self.config, "pyvhr_preflight_isolated", True))
         timeout_s = float(getattr(self.config, "pyvhr_preflight_timeout_s", 30.0))
         if isolated_enabled:
-            try:
-                diagnostics = _preflight_pyvhr_import_isolated(
-                    self._import_context,
-                    timeout_s=timeout_s,
-                )
-            except Exception as exc:
-                print(
-                    f"[TRACE] Isolated pyVHR preflight failed; retrying in-process: {repr(exc)}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                self.last_diagnostics["pyvhr_preflight_retry"] = {
-                    "isolated": True,
-                    "timeout_s": timeout_s,
-                    "error": repr(exc),
-                }
-                diagnostics = _preflight_pyvhr_import(self._import_context)
-                diagnostics["preflight_retry_after_error"] = repr(exc)
-                diagnostics["preflight_retry_mode"] = "in_process"
+            diagnostics = _preflight_pyvhr_import_isolated(
+                self._import_context,
+                timeout_s=timeout_s,
+            )
         else:
             diagnostics = _preflight_pyvhr_import(self._import_context)
         self.last_diagnostics.setdefault("pyvhr_import", diagnostics)
@@ -1044,22 +1453,25 @@ class CardiacPhaseExtractor:
         kernel = _gaussian_kernel_1d(sigma_samples)
         min_distance = max(1, int(fs * 60.0 / 200.0))
 
-        consensus_prob = np.zeros(len(common_times), dtype=float)
+        n_times = len(common_times)
+        n_methods = len(method_results)
+        consensus_prob = np.zeros(n_times, dtype=float)
         weight_sum = 0.0
-        bvp_accum = np.zeros(len(common_times), dtype=float)
-        bvp_weight_sum = np.zeros(len(common_times), dtype=float)
-        bpm_accum = np.zeros(len(common_times), dtype=float)
-        bpm_weight_sum = np.zeros(len(common_times), dtype=float)
-        phase_vectors = np.zeros(len(common_times), dtype=complex)
-        phase_weight_sum = np.zeros(len(common_times), dtype=float)
+        bvp_matrix = np.full((n_methods, n_times), np.nan, dtype=float)
+        bpm_matrix = np.full((n_methods, n_times), np.nan, dtype=float)
+        phase_matrix = np.full((n_methods, n_times), np.nan, dtype=float)
+        method_weights = np.zeros(n_methods, dtype=float)
         method_diags: List[Dict[str, Any]] = []
 
-        for result in method_results:
+        for idx, result in enumerate(method_results):
             weight = float(max(result.get("quality", 0.0), 1e-6))
+            method_weights[idx] = weight
             times = np.asarray(result["times"], dtype=float)
             bpm = _resample_numeric_to_grid(times, np.asarray(result["bpm"], dtype=float), common_times)
             phase = _circular_interp(times, np.asarray(result["phase"], dtype=float), common_times)
             bvp = _resample_numeric_to_grid(times, np.asarray(result["bvp"], dtype=float), common_times)
+            bpm_matrix[idx] = bpm
+            phase_matrix[idx] = phase
             bvp_z = bvp.copy()
             finite_bvp = np.isfinite(bvp_z)
             if np.any(finite_bvp):
@@ -1069,16 +1481,7 @@ class CardiacPhaseExtractor:
                     bvp_z[finite_bvp] = (bvp_z[finite_bvp] - mu) / sd
                 else:
                     bvp_z[finite_bvp] = bvp_z[finite_bvp] - mu
-                bvp_accum[finite_bvp] += weight * bvp_z[finite_bvp]
-                bvp_weight_sum[finite_bvp] += weight
-
-            finite_bpm = np.isfinite(bpm)
-            bpm_accum[finite_bpm] += weight * bpm[finite_bpm]
-            bpm_weight_sum[finite_bpm] += weight
-
-            finite_phase = np.isfinite(phase)
-            phase_vectors[finite_phase] += weight * np.exp(1j * phase[finite_phase])
-            phase_weight_sum[finite_phase] += weight
+            bvp_matrix[idx] = bvp_z
 
             peak_train = np.zeros(len(common_times), dtype=float)
             peak_times = np.asarray(result.get("peak_times", []), dtype=float)
@@ -1111,11 +1514,17 @@ class CardiacPhaseExtractor:
 
         consensus_peak_times = common_times[consensus_peak_idx] if len(consensus_peak_idx) else np.array([], dtype=float)
         phase = _phase_from_peaks(common_times, consensus_peak_times)
+        phase_vectors = np.nansum(
+            np.where(np.isfinite(phase_matrix), np.exp(1j * phase_matrix), np.nan) * method_weights[:, None],
+            axis=0,
+        )
         valid_phase = np.isfinite(phase)
         phase_mean = np.mod(np.angle(phase_vectors), 2.0 * np.pi)
         phase = np.where(valid_phase, phase, phase_mean)
 
-        bpm = np.divide(bpm_accum, bpm_weight_sum, out=np.full(len(common_times), np.nan, dtype=float), where=bpm_weight_sum > 0)
+        bpm_num = np.nansum(bpm_matrix * method_weights[:, None], axis=0)
+        bpm_den = np.nansum(np.where(np.isfinite(bpm_matrix), method_weights[:, None], 0.0), axis=0)
+        bpm = np.divide(bpm_num, bpm_den, out=np.full(n_times, np.nan, dtype=float), where=bpm_den > 0)
         if len(consensus_peak_times) >= 2:
             ibi = np.diff(consensus_peak_times)
             instant_bpm = 60.0 / ibi
@@ -1124,7 +1533,9 @@ class CardiacPhaseExtractor:
             finite_peak_bpm = np.isfinite(bpm_from_peaks)
             bpm[finite_peak_bpm] = bpm_from_peaks[finite_peak_bpm]
 
-        bvp = np.divide(bvp_accum, bvp_weight_sum, out=np.full(len(common_times), np.nan, dtype=float), where=bvp_weight_sum > 0)
+        bvp_num = np.nansum(bvp_matrix * method_weights[:, None], axis=0)
+        bvp_den = np.nansum(np.where(np.isfinite(bvp_matrix), method_weights[:, None], 0.0), axis=0)
+        bvp = np.divide(bvp_num, bvp_den, out=np.full(n_times, np.nan, dtype=float), where=bvp_den > 0)
         if not np.any(np.isfinite(bvp)):
             bvp = np.sin(phase)
         else:
@@ -1151,24 +1562,10 @@ class CardiacPhaseExtractor:
         if not methods:
             methods = [self.config.rppg_method]
 
-        try:
-            import_diag = self._check_pyvhr_ready()
-        except Exception as exc:
-            self.last_diagnostics = {
-                "backend": "pyvhr_consensus",
-                "preflight_error": repr(exc),
-            }
-            raise
+        import_diag = self._check_pyvhr_ready()
 
         failures: List[Dict[str, Any]] = []
-        try:
-            successes = self._run_pyvhr_methods(video_path=video_path, methods=methods)
-        except Exception as exc:
-            failures.extend({"method": method, "error": repr(exc)} for method in methods)
-            print(f"[TRACE] pyVHR batch failed for methods {methods}: {repr(exc)}", file=sys.stderr, flush=True)
-            if not self.config.pyvhr_drop_failed_methods:
-                raise
-            successes = []
+        successes = self._run_pyvhr_methods(video_path=video_path, methods=methods)
 
         for payload in successes:
             print(
@@ -1241,8 +1638,10 @@ class EyeMovementExtractor:
         timestamps: List[float] = []
 
         frame_idx = 0
+        face_rect: Optional[Tuple[int, int, int, int]] = None
+        stride = max(1, int(getattr(self.config, "face_detection_refresh_stride", 5)))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        pbar = tqdm(total=total_frames, desc="Eye (cv2 pupil) frames", unit="fr") if tqdm and total_frames and total_frames > 0 and self.config.verbose else None
+        pbar = _make_tqdm(total=total_frames, desc="Eye (cv2 pupil) frames", unit="fr") if total_frames and total_frames > 0 and self.config.verbose else None
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -1250,7 +1649,8 @@ class EyeMovementExtractor:
             if self.config.max_frames is not None and frame_idx >= self.config.max_frames:
                 break
 
-            face_rect = _detect_face_roi(frame, self.config.face_margin_px)
+            if face_rect is None or (frame_idx % stride == 0):
+                face_rect = _detect_face_roi(frame, self.config.face_margin_px)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             movement_xy, sample_confidence, sample_head_xy, eye_boxes = _estimate_eye_motion_sample(
                 gray_frame=gray,
@@ -1307,6 +1707,13 @@ class MultimodalSynchronizer:
         logger.info("Synchronizing cardiac and eye signals")
         print("[TRACE] Entering MultimodalSynchronizer.synchronize", file=sys.stderr, flush=True)
 
+        if len(cardiac_times) < 2 or len(gaze_times) < 2:
+            raise RuntimeError(
+                "Insufficient samples to synchronize cardiac and gaze signals. "
+                f"cardiac_samples={len(cardiac_times)}, gaze_samples={len(gaze_times)}; "
+                "collect more data or reduce analysis window size."
+            )
+
         t_start = max(cardiac_times[0], gaze_times[0])
         t_end = min(cardiac_times[-1], gaze_times[-1])
         if t_end <= t_start:
@@ -1314,10 +1721,23 @@ class MultimodalSynchronizer:
 
         sample_fps = self.config.output_fps
         if sample_fps is None:
-            cardiac_dt = np.nanmedian(np.diff(cardiac_times))
-            gaze_dt = np.nanmedian(np.diff(gaze_times))
-            sample_fps = 1.0 / max(cardiac_dt, gaze_dt)
+            cardiac_dt = float(np.nanmedian(np.diff(cardiac_times)))
+            gaze_dt = float(np.nanmedian(np.diff(gaze_times)))
+            dt_candidates = [dt for dt in (cardiac_dt, gaze_dt) if np.isfinite(dt) and dt > 0]
+            if not dt_candidates:
+                raise RuntimeError(
+                    "Invalid sample spacing for synchronization. "
+                    f"cardiac_dt={cardiac_dt}, gaze_dt={gaze_dt}"
+                )
+            sample_fps = 1.0 / max(dt_candidates)
+        if not np.isfinite(sample_fps) or sample_fps <= 0:
+            raise RuntimeError("Invalid synchronization output_fps")
         n_samples = int(math.floor((t_end - t_start) * sample_fps)) + 1
+        if n_samples < 2:
+            raise RuntimeError(
+                "Synchronization grid has fewer than 2 samples. "
+                f"n_samples={n_samples}, t_start={t_start}, t_end={t_end}, output_fps={sample_fps}"
+            )
         t_common = np.linspace(t_start, t_end, n_samples)
 
         phase_sync = _circular_interp(cardiac_times, cardiac_phase, t_common)
@@ -1335,6 +1755,18 @@ class MultimodalSynchronizer:
         blink_metric_interp = None
         if blink_metric is not None and len(blink_metric) == len(gaze_times):
             blink_metric_interp = _interp1d_eval(gaze_times, blink_metric, t_common, kind="linear", fill_value=np.nan)
+
+        for name, values in (
+            ("phase_sync", phase_sync),
+            ("bpm_values", bpm_values),
+            ("bvp_values", bvp_values),
+            ("gaze_x_values", gaze_x_values),
+            ("gaze_y_values", gaze_y_values),
+            ("conf_values", conf_values),
+            ("blink_values", blink_values),
+        ):
+            if len(values) != n_samples:
+                raise RuntimeError(f"Synchronization length mismatch for {name}: {len(values)} != {n_samples}")
 
         df_dict: Dict[str, Any] = {
             "time_s": t_common,
@@ -1362,8 +1794,8 @@ class MultimodalSynchronizer:
         return df
 
 
-def add_eye_velocity_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
+def add_eye_velocity_features(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
+    out = df if inplace else df.copy()
     dt = out["time_s"].diff().to_numpy(dtype=float)
     dx = out["gaze_x"].diff().to_numpy(dtype=float)
     dy = out["gaze_y"].diff().to_numpy(dtype=float)
@@ -1422,8 +1854,9 @@ def add_eye_velocity_features(df: pd.DataFrame) -> pd.DataFrame:
 def add_eye_movement_state_features(
     df: pd.DataFrame,
     config: MultimodalExtractionConfig,
+    inplace: bool = False,
 ) -> pd.DataFrame:
-    out = df.copy()
+    out = df if inplace else df.copy()
     velocity = out["analysis_velocity_abs"].to_numpy(dtype=float)
     valid = out["sync_valid"].to_numpy(dtype=bool) & np.isfinite(velocity)
     finite_velocity = velocity[valid]
@@ -1477,6 +1910,115 @@ def add_eye_movement_state_features(
     out["movement_onset"] = onset & valid
     out["movement_velocity_threshold"] = threshold
     return out
+
+
+def add_redness_phase_reference(
+    df: pd.DataFrame,
+    phase_column: str = "cardiac_phase_rad",
+    signal_column: str = "bvp_signal",
+    bin_count: int = 72,
+    inplace: bool = False,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    out = df if inplace else df.copy()
+    summary: Dict[str, Any] = {
+        "reference_signal": signal_column,
+        "phase_column_source": phase_column,
+        "phase_column_output": "cardiac_phase_redness0_rad",
+        "phase_degrees_output": "cardiac_phase_redness0_deg",
+        "bins_requested": int(bin_count),
+        "bins_used": 0,
+        "sample_count": 0,
+        "redness_min_phase_rad": math.nan,
+        "redness_min_phase_deg": math.nan,
+        "redness_peak_phase_rad": math.nan,
+        "redness_peak_phase_deg": math.nan,
+        "redness_peak_phase_in_redness0_rad": math.nan,
+        "redness_peak_phase_in_redness0_deg": math.nan,
+        "phase_shift_rad": math.nan,
+        "phase_shift_deg": math.nan,
+    }
+
+    if phase_column not in out.columns:
+        out["cardiac_phase_redness0_rad"] = np.nan
+        out["cardiac_phase_redness0_deg"] = np.nan
+        summary["error"] = f"Missing phase column: {phase_column}"
+        return out, summary
+
+    base_phase = np.asarray(out[phase_column], dtype=float)
+    out["cardiac_phase_redness0_rad"] = np.mod(base_phase, 2.0 * np.pi)
+    out["cardiac_phase_redness0_deg"] = np.degrees(out["cardiac_phase_redness0_rad"])
+
+    if signal_column not in out.columns:
+        summary["error"] = f"Missing signal column: {signal_column}"
+        return out, summary
+
+    valid = (
+        out.get("sync_valid", pd.Series(np.ones(len(out), dtype=bool))).to_numpy(dtype=bool)
+        & np.isfinite(base_phase)
+        & np.isfinite(np.asarray(out[signal_column], dtype=float))
+    )
+    summary["sample_count"] = int(np.sum(valid))
+    if np.sum(valid) < 20:
+        summary["error"] = "Too few valid samples for redness phase anchoring"
+        return out, summary
+
+    phase = np.mod(np.asarray(out.loc[valid, phase_column], dtype=float), 2.0 * np.pi)
+    signal = np.asarray(out.loc[valid, signal_column], dtype=float)
+
+    bins = max(24, int(bin_count))
+    edges = np.linspace(0.0, 2.0 * np.pi, bins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    ids = np.digitize(phase, edges, right=False) - 1
+    ids = np.clip(ids, 0, bins - 1)
+
+    mean_signal = np.full(bins, np.nan, dtype=float)
+    counts = np.zeros(bins, dtype=int)
+    for idx in range(bins):
+        mask = ids == idx
+        counts[idx] = int(np.sum(mask))
+        if counts[idx] > 0:
+            mean_signal[idx] = float(np.nanmean(signal[mask]))
+
+    finite = np.isfinite(mean_signal)
+    if np.sum(finite) < max(8, bins // 6):
+        summary["error"] = "Insufficient populated phase bins for redness phase anchoring"
+        return out, summary
+
+    fill = float(np.nanmean(mean_signal[finite]))
+    filled = np.where(np.isfinite(mean_signal), mean_signal, fill)
+    # Circular smoothing to stabilize peak/min estimates.
+    kernel = np.array([1.0, 2.0, 3.0, 2.0, 1.0], dtype=float)
+    kernel = kernel / np.sum(kernel)
+    half = len(kernel) // 2
+    smooth = np.zeros_like(filled)
+    for offset, coeff in enumerate(kernel):
+        shift = offset - half
+        smooth += coeff * np.roll(filled, -shift)
+
+    min_idx = int(np.argmin(smooth))
+    max_idx = int(np.argmax(smooth))
+    min_phase = float(centers[min_idx])
+    max_phase = float(centers[max_idx])
+    shift = min_phase
+
+    out["cardiac_phase_redness0_rad"] = np.mod(base_phase - shift, 2.0 * np.pi)
+    out["cardiac_phase_redness0_deg"] = np.degrees(out["cardiac_phase_redness0_rad"])
+
+    peak_in_redness0 = float(np.mod(max_phase - shift, 2.0 * np.pi))
+    summary.update(
+        {
+            "bins_used": int(bins),
+            "redness_min_phase_rad": min_phase,
+            "redness_min_phase_deg": float(np.degrees(min_phase)),
+            "redness_peak_phase_rad": max_phase,
+            "redness_peak_phase_deg": float(np.degrees(max_phase)),
+            "redness_peak_phase_in_redness0_rad": peak_in_redness0,
+            "redness_peak_phase_in_redness0_deg": float(np.degrees(peak_in_redness0)),
+            "phase_shift_rad": shift,
+            "phase_shift_deg": float(np.degrees(shift)),
+        }
+    )
+    return out, summary
 
 
 def circular_phase_summary(df: pd.DataFrame, config: MultimodalExtractionConfig) -> pd.DataFrame:
@@ -1846,13 +2388,7 @@ class LiveFrameAnalyzer:
             return pd.DataFrame(), {}
         fps = 1.0 / median_dt
 
-        try:
-            filtered = self.cardiac_extractor._bandpass_filter(_detrend(raw_green), fps)
-        except Exception as exc:
-            print("[TRACE] Bandpass filtering failed; falling back to detrended signal:", repr(exc), file=sys.stderr)
-            traceback.print_exc()
-            logger.exception("Bandpass filtering failed; falling back to detrended signal: %s", exc)
-            filtered = _detrend(raw_green)
+        filtered = self.cardiac_extractor._bandpass_filter(_detrend(raw_green), fps)
         peaks = self.cardiac_extractor._find_bvp_peaks(filtered, fps)
         peak_times = times[peaks] if len(peaks) else np.array([], dtype=float)
         phase = _phase_from_peaks(times, peak_times)
@@ -1887,12 +2423,20 @@ class LiveFrameAnalyzer:
             head_xy=head_xy,
             blink_metric=blink_metric,
         )
-        df = add_eye_velocity_features(df)
-        df = add_eye_movement_state_features(df, self.config)
+        df, redness_phase_ref = add_redness_phase_reference(
+            df,
+            phase_column="cardiac_phase_rad",
+            signal_column="bvp_signal",
+            bin_count=max(24, self.config.phase_bin_count * 6),
+            inplace=True,
+        )
+        df = add_eye_velocity_features(df, inplace=True)
+        df = add_eye_movement_state_features(df, self.config, inplace=True)
         phase_summary = circular_phase_summary(df, self.config)
         blink_summary = blink_phase_summary(df, self.config)
         phase_stats = compute_phase_modulation_statistics(df, self.config)
         summary = compute_global_summary(df, phase_summary, blink_summary, self.config, phase_stats=phase_stats)
+        summary["redness_phase_reference"] = redness_phase_ref
         return df, summary
 
 
@@ -1908,41 +2452,104 @@ def extract_cardiac_and_eye_timeseries(
         config = MultimodalExtractionConfig(video_path=str(video))
 
     print(f"[TRACE] Starting extraction for video: {video}", file=sys.stderr, flush=True)
-    cardiac_extractor = CardiacPhaseExtractor(config)
-    phase, cardiac_times, bpm, bvp = cardiac_extractor.extract(str(video))
-    print("[TRACE] Cardiac extraction returned successfully", file=sys.stderr, flush=True)
+    stage_t0 = time.perf_counter()
+    stage_times: Dict[str, float] = {}
+    stage_total = 5 if config.preprocess_face_video else 4
+    stage_pbar = _make_tqdm(total=stage_total, desc="Pipeline stages", unit="stage") if config.verbose else None
+    analysis_video_path = str(video)
+    preprocessed_video_path: Optional[str] = None
 
-    eye_extractor = EyeMovementExtractor(config)
-    gaze_xy, gaze_times, gaze_confidence, blink_flags, head_xy, blink_metric = eye_extractor.extract(str(video))
+    try:
+        if config.preprocess_face_video:
+            stage_pre = time.perf_counter()
+            preprocessor = FacePreprocessor(config)
+            analysis_video_path, preprocess_info = preprocessor.preprocess(str(video))
+            stage_times["face_preprocessing_s"] = float(time.perf_counter() - stage_pre)
+            preprocessed_video_path = analysis_video_path if analysis_video_path != str(video) else None
+            if stage_pbar is not None:
+                stage_pbar.update(1)
+                stage_pbar.set_postfix_str("preprocess")
+        else:
+            preprocess_info = {"enabled": False}
 
-    synchronizer = MultimodalSynchronizer(config)
-    df = synchronizer.synchronize(
-        cardiac_phase=phase,
-        cardiac_times=cardiac_times,
-        bpm=bpm,
-        bvp=bvp,
-        gaze_xy=gaze_xy,
-        gaze_times=gaze_times,
-        gaze_confidence=gaze_confidence,
-        blink_flags=blink_flags,
-        head_xy=head_xy,
-        blink_metric=blink_metric,
-    )
-    df = add_eye_velocity_features(df)
-    df = add_eye_movement_state_features(df, config)
-    phase_summary = circular_phase_summary(df, config)
-    blink_summary = blink_phase_summary(df, config)
-    movement_summary = movement_state_phase_summary(df, config)
-    phase_stats = compute_phase_modulation_statistics(df, config)
-    summary = compute_global_summary(df, phase_summary, blink_summary, config, phase_stats=phase_stats)
-    summary["movement_state_phase_summary"] = movement_summary.to_dict(orient="records")
-    cardiac_diagnostics = getattr(cardiac_extractor, "last_diagnostics", None)
-    if cardiac_diagnostics:
-        summary["cardiac_diagnostics"] = cardiac_diagnostics
+        cardiac_extractor = CardiacPhaseExtractor(config)
+        cardiac_stage_start = time.perf_counter()
+        phase, cardiac_times, bpm, bvp = cardiac_extractor.extract(analysis_video_path)
+        stage_times["cardiac_extraction_s"] = float(time.perf_counter() - cardiac_stage_start)
+        print("[TRACE] Cardiac extraction returned successfully", file=sys.stderr, flush=True)
+        if stage_pbar is not None:
+            stage_pbar.update(1)
+            stage_pbar.set_postfix_str("cardiac")
 
-    if output_csv:
-        df.to_csv(output_csv, index=False)
-    return df, phase_summary, blink_summary, summary
+        stage_t1 = time.perf_counter()
+        eye_extractor = EyeMovementExtractor(config)
+        gaze_xy, gaze_times, gaze_confidence, blink_flags, head_xy, blink_metric = eye_extractor.extract(analysis_video_path)
+        stage_times["eye_extraction_s"] = float(time.perf_counter() - stage_t1)
+        if stage_pbar is not None:
+            stage_pbar.update(1)
+            stage_pbar.set_postfix_str("eyes")
+
+        stage_t2 = time.perf_counter()
+        synchronizer = MultimodalSynchronizer(config)
+        df = synchronizer.synchronize(
+            cardiac_phase=phase,
+            cardiac_times=cardiac_times,
+            bpm=bpm,
+            bvp=bvp,
+            gaze_xy=gaze_xy,
+            gaze_times=gaze_times,
+            gaze_confidence=gaze_confidence,
+            blink_flags=blink_flags,
+            head_xy=head_xy,
+            blink_metric=blink_metric,
+        )
+        stage_times["synchronization_s"] = float(time.perf_counter() - stage_t2)
+        stage_t3 = time.perf_counter()
+        df, redness_phase_ref = add_redness_phase_reference(
+            df,
+            phase_column="cardiac_phase_rad",
+            signal_column="bvp_signal",
+            bin_count=max(24, config.phase_bin_count * 6),
+            inplace=True,
+        )
+        df = add_eye_velocity_features(df, inplace=True)
+        df = add_eye_movement_state_features(df, config, inplace=True)
+        stage_times["feature_engineering_s"] = float(time.perf_counter() - stage_t3)
+        if stage_pbar is not None:
+            stage_pbar.update(1)
+            stage_pbar.set_postfix_str("features")
+
+        stage_t4 = time.perf_counter()
+        phase_summary = circular_phase_summary(df, config)
+        blink_summary = blink_phase_summary(df, config)
+        movement_summary = movement_state_phase_summary(df, config)
+        phase_stats = compute_phase_modulation_statistics(df, config)
+        summary = compute_global_summary(df, phase_summary, blink_summary, config, phase_stats=phase_stats)
+        stage_times["statistics_s"] = float(time.perf_counter() - stage_t4)
+        stage_times["total_pipeline_s"] = float(sum(stage_times.values()))
+        summary["redness_phase_reference"] = redness_phase_ref
+        summary["movement_state_phase_summary"] = movement_summary.to_dict(orient="records")
+        summary["pipeline_stage_timings_s"] = stage_times
+        summary["preprocessing"] = preprocess_info
+        cardiac_diagnostics = getattr(cardiac_extractor, "last_diagnostics", None)
+        if cardiac_diagnostics:
+            summary["cardiac_diagnostics"] = cardiac_diagnostics
+
+        if stage_pbar is not None:
+            stage_pbar.update(1)
+            stage_pbar.set_postfix_str("stats")
+
+        if output_csv:
+            df.to_csv(output_csv, index=False)
+        return df, phase_summary, blink_summary, summary
+    finally:
+        if stage_pbar is not None:
+            stage_pbar.close()
+        if preprocessed_video_path and not config.preprocess_keep_video:
+            try:
+                os.unlink(preprocessed_video_path)
+            except OSError:
+                pass
 
 
 def save_outputs(
@@ -1979,6 +2586,8 @@ def save_outputs(
     array_columns = [
         "time_s",
         "cardiac_phase_rad",
+        "cardiac_phase_redness0_rad",
+        "cardiac_phase_redness0_deg",
         "heart_bpm",
         "bvp_signal",
         "gaze_x",
@@ -2057,13 +2666,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pyvhr-timeout-s",
         type=float,
-        default=120.0,
+        default=6000.0,
         help="Timeout for isolated pyVHR extraction before falling back.",
     )
     parser.add_argument(
         "--isolate-pyvhr",
         action="store_true",
-        help="Run each pyVHR method in an isolated child process.",
+        default=True,
+        help="Run pyVHR extraction in an isolated child process (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-isolate-pyvhr",
+        dest="isolate_pyvhr",
+        action="store_false",
+        help="Disable isolated pyVHR execution (not recommended for debugging native crashes).",
     )
     parser.add_argument(
         "--no-isolated-pyvhr-preflight",
@@ -2075,6 +2691,47 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=30.0,
         help="Timeout for isolated pyVHR import preflight.",
+    )
+    parser.add_argument(
+        "--holistic-downsample-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor in (0,1] for FaceMesh inference during holistic extraction. Lower is faster.",
+    )
+    parser.add_argument(
+        "--holistic-landmark-refresh-stride",
+        type=int,
+        default=3,
+        help="Run FaceMesh every N frames and reuse landmarks between refreshes.",
+    )
+    parser.add_argument(
+        "--face-detection-refresh-stride",
+        type=int,
+        default=5,
+        help="Run full face detection every N frames and reuse the latest ROI between refreshes.",
+    )
+    parser.add_argument(
+        "--no-face-preprocess",
+        dest="preprocess_face_video",
+        action="store_false",
+        help="Disable the initial face-isolation crop/stabilization stage.",
+    )
+    parser.add_argument(
+        "--face-preprocess-scale",
+        type=float,
+        default=1.8,
+        help="Padding multiplier around the detected face for the preprocessed clip.",
+    )
+    parser.add_argument(
+        "--face-preprocess-size",
+        type=int,
+        default=256,
+        help="Square output size for the preprocessed face clip.",
+    )
+    parser.add_argument(
+        "--keep-face-preprocess-video",
+        action="store_true",
+        help="Keep the generated face-cropped video in the output directory.",
     )
     return parser
 
@@ -2107,24 +2764,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         eye_confidence_threshold=args.eye_confidence_threshold,
         output_csv=args.output_csv,
         cardiac_backend=args.cardiac_backend,
-        isolate_pyvhr=getattr(args, "isolate_pyvhr", False),
+        isolate_pyvhr=bool(getattr(args, "isolate_pyvhr", True)),
         pyvhr_timeout_s=args.pyvhr_timeout_s,
         pyvhr_preflight_isolated=not getattr(args, "no_isolated_pyvhr_preflight", False),
         pyvhr_preflight_timeout_s=getattr(args, "pyvhr_preflight_timeout_s", 30.0),
+        holistic_downsample_scale=float(getattr(args, "holistic_downsample_scale", 1.0)),
+        holistic_landmark_refresh_stride=int(getattr(args, "holistic_landmark_refresh_stride", 3)),
+        face_detection_refresh_stride=max(1, int(getattr(args, "face_detection_refresh_stride", 5))),
+        preprocess_face_video=bool(getattr(args, "preprocess_face_video", True)),
+        preprocess_face_scale=float(getattr(args, "face_preprocess_scale", 1.8)),
+        preprocess_output_size=int(getattr(args, "face_preprocess_size", 256)),
+        preprocess_keep_video=bool(getattr(args, "keep_face_preprocess_video", False)),
     )
 
-    try:
-        df, phase_summary, blink_summary, summary = extract_cardiac_and_eye_timeseries(
-            video_path=args.video_path,
-            output_csv=args.output_csv,
-            config=config,
-        )
-        outputs = save_outputs(df, phase_summary, blink_summary, summary, config)
-    except Exception as exc:
-        print("[TRACE] Pipeline failed:", repr(exc), file=sys.stderr)
-        traceback.print_exc()
-        logger.exception("Pipeline failed: %s", exc)
-        return 1
+    df, phase_summary, blink_summary, summary = extract_cardiac_and_eye_timeseries(
+        video_path=args.video_path,
+        output_csv=args.output_csv,
+        config=config,
+    )
+    outputs = save_outputs(df, phase_summary, blink_summary, summary, config)
 
     logger.info("Pipeline complete")
     for name, path in outputs.items():
@@ -2139,27 +2797,37 @@ def _collect_python_site_paths() -> List[str]:
         getter = getattr(site, getter_name, None)
         if getter is None:
             continue
-        try:
-            values = getter()
-        except Exception:
-            continue
+        values = getter()
         if isinstance(values, (list, tuple)):
             for value in values:
                 if value and value not in paths:
                     paths.append(str(value))
-    try:
-        user_site = site.getusersitepackages()
-        if isinstance(user_site, str) and user_site and user_site not in paths:
-            paths.append(user_site)
-    except Exception:
-        pass
+    user_site = site.getusersitepackages()
+    if isinstance(user_site, str) and user_site and user_site not in paths:
+        paths.append(user_site)
     return paths
 
 
 def _make_import_context() -> Dict[str, Any]:
+    script_dir = Path(__file__).resolve().parent
+    project_roots: List[str] = []
+    for candidate in (Path(os.getcwd()), script_dir.parent, script_dir):
+        resolved = str(candidate.resolve())
+        if resolved not in project_roots:
+            project_roots.append(resolved)
+
+    sys_path_entries: List[str] = []
+    for entry in sys.path:
+        value = str(entry) if entry is not None else ""
+        if not value:
+            value = os.getcwd()
+        if value and value not in sys_path_entries:
+            sys_path_entries.append(value)
+
     return {
-        "sys_path": list(dict.fromkeys(str(p) for p in sys.path if p)),
+        "sys_path": sys_path_entries,
         "site_paths": _collect_python_site_paths(),
+        "project_roots": project_roots,
         "sys_executable": str(sys.executable),
         "base_executable": str(getattr(sys, "_base_executable", sys.executable)),
         "sys_prefix": str(sys.prefix),
@@ -2172,11 +2840,14 @@ def _apply_import_context(import_context: Optional[Dict[str, Any]]) -> None:
     if not import_context:
         return
     prepend: List[str] = []
-    for key in ("sys_path", "site_paths"):
+    for key in ("project_roots", "sys_path", "site_paths"):
         for entry in import_context.get(key, []) or []:
             entry = str(entry)
             if entry and entry not in prepend:
                 prepend.append(entry)
+    cwd = str(import_context.get("cwd", "") or "")
+    if cwd and cwd not in prepend:
+        prepend.append(cwd)
     for entry in reversed(prepend):
         if entry not in sys.path:
             sys.path.insert(0, entry)
@@ -2199,7 +2870,7 @@ def _preflight_pyvhr_import(import_context: Optional[Dict[str, Any]] = None) -> 
             "MediaPipe wheels support Python 3.9-3.12."
         )
 
-    print(f"[TRACE] _preflight_pyvhr_import find_spec sys.executable={sys.executable}", file=sys.stderr, flush=True)
+    _trace(f"[TRACE] _preflight_pyvhr_import find_spec sys.executable={sys.executable}")
     spec = importlib.util.find_spec("pyVHR")
     if spec is None:
         raise ModuleNotFoundError(
@@ -2207,18 +2878,21 @@ def _preflight_pyvhr_import(import_context: Optional[Dict[str, Any]] = None) -> 
             f"sys.executable={sys.executable!r}, sys.prefix={sys.prefix!r}"
         )
 
-    print("[TRACE] _preflight_pyvhr_import import pyVHR start", file=sys.stderr, flush=True)
+    _trace("[TRACE] _preflight_pyvhr_import import pyVHR start")
     module = importlib.import_module("pyVHR")
-    print("[TRACE] _preflight_pyvhr_import import saccard start", file=sys.stderr, flush=True)
-    saccard_module = importlib.import_module("saccard")
-    print("[TRACE] _preflight_pyvhr_import imports done", file=sys.stderr, flush=True)
+    _trace("[TRACE] _preflight_pyvhr_import check saccard.core spec")
+    core_spec = importlib.util.find_spec("saccard.core")
+    if core_spec is None:
+        raise ModuleNotFoundError(
+            "Could not find module 'saccard.core'. Ensure the project source is available on sys.path. "
+            f"sys.executable={sys.executable!r}, sys.prefix={sys.prefix!r}"
+        )
+    _trace("[TRACE] _preflight_pyvhr_import imports done")
 
-    saccard_fn = getattr(saccard_module, "saccard", None)
-    if saccard_fn is None or not callable(saccard_fn):
-        raise ImportError("Imported package 'saccard', but callable 'saccard' was not found")
     return {
         "module_file": str(getattr(module, "__file__", "")),
-        "saccard_module_file": str(getattr(saccard_module, "__file__", "")),
+        "saccard_module_file": str(getattr(core_spec, "origin", "") or ""),
+        "saccard_core_module_file": str(getattr(core_spec, "origin", "") or ""),
         "sys_executable": str(sys.executable),
         "sys_prefix": str(sys.prefix),
         "python_version": f"{pyver[0]}.{pyver[1]}.{pyver[2]}",

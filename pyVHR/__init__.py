@@ -19,10 +19,5 @@ warnings.filterwarnings(
 	category=UserWarning,
 )
 
-import pyVHR.extraction
-import pyVHR.BVP
-import pyVHR.BPM
-import pyVHR.plot
-import pyVHR.utils
-import pyVHR.deepRPPG
+# Keep package import lightweight. Submodules are imported lazily by callers.
 

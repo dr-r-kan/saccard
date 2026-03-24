@@ -1,4 +1,7 @@
-from .sig_processing import *
-from .skin_extraction_methods import *
-from .sig_extraction_methods import *
-from .utils import *
+"""Extraction subpackage for pyVHR.
+
+Import concrete modules directly, for example:
+	from pyVHR.extraction.sig_processing import SignalProcessing
+"""
+
+__all__: list[str] = []

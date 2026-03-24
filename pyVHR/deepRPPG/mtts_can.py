@@ -16,11 +16,9 @@ from skimage.util import img_as_float
 from scipy.sparse import spdiags
 
 tf.get_logger().setLevel('ERROR')
-try:
-  from tensorflow.python.util import deprecation as _tf_deprecation
+from tensorflow.python.util import deprecation as _tf_deprecation
+if hasattr(_tf_deprecation, '_PRINT_DEPRECATION_WARNINGS'):
   _tf_deprecation._PRINT_DEPRECATION_WARNINGS = False
-except Exception:
-  pass
 
 def preprocess_raw_video(frames, fs=30, dim=36):
   """A slightly different version from the original: 

@@ -15,27 +15,15 @@ from pyVHR.extraction.utils import *
 from pyVHR.extraction.skin_extraction_methods import *
 from pyVHR.extraction.sig_extraction_methods import *
 from pyVHR.utils.cuda_utils import *
+from tqdm import tqdm
 
 absl_logging.set_verbosity(absl_logging.ERROR)
 
 
 @contextmanager
 def _suppress_native_stderr():
-    """Temporarily silence native C/C++ logs written directly to stderr."""
-    try:
-        stderr_fd = sys.stderr.fileno()
-    except Exception:
-        yield
-        return
-
-    saved_stderr_fd = os.dup(stderr_fd)
-    try:
-        with open(os.devnull, 'w') as devnull:
-            os.dup2(devnull.fileno(), stderr_fd)
-            yield
-    finally:
-        os.dup2(saved_stderr_fd, stderr_fd)
-        os.close(saved_stderr_fd)
+    """Compatibility wrapper; stderr is no longer suppressed."""
+    yield
 
 """
 This module defines classes or methods used for Signal extraction and processing.
@@ -53,15 +41,12 @@ def _normalized_to_pixel_coordinates(normalized_x, normalized_y, image_width, im
 
 def _landmark_is_valid(landmark, visibility_threshold=0.5, presence_threshold=0.5):
     """Check if a mediapipe landmark meets visibility and presence thresholds."""
-    try:
-        # HasField raises ValueError for non-optional proto3 scalar fields;
-        # in proto3_optional fields (as used by MediaPipe), it works as expected.
-        if landmark.HasField('visibility') and landmark.visibility < visibility_threshold:
-            return False
-        if landmark.HasField('presence') and landmark.presence < presence_threshold:
-            return False
-    except ValueError:
-        pass
+    # HasField raises ValueError for non-optional proto3 scalar fields;
+    # in proto3_optional fields (as used by MediaPipe), it works as expected.
+    if landmark.HasField('visibility') and landmark.visibility < visibility_threshold:
+        return False
+    if landmark.HasField('presence') and landmark.presence < presence_threshold:
+        return False
     return True
 
 class SignalProcessing():
@@ -91,6 +76,26 @@ class SignalProcessing():
         self.font_color = (255, 0, 0, 255)
         self.visualize_skin_collection = []
         self.visualize_landmarks_collection = []
+        self.holistic_downsample_scale = 1.0
+        self.holistic_landmark_refresh_stride = 1
+
+    def set_holistic_speedup(self, downsample_scale=1.0, landmark_refresh_stride=1):
+        """
+        Configure CPU acceleration knobs for holistic extraction.
+
+        Args:
+            downsample_scale (float): Scale used for FaceMesh inference only.
+                Values in (0, 1] reduce inference cost; 1.0 disables downsampling.
+            landmark_refresh_stride (int): Run FaceMesh every N frames and reuse
+                the most recent landmarks in-between.
+        """
+        scale = float(downsample_scale)
+        if not np.isfinite(scale):
+            scale = 1.0
+        self.holistic_downsample_scale = float(min(max(scale, 0.25), 1.0))
+
+        stride = int(landmark_refresh_stride)
+        self.holistic_landmark_refresh_stride = max(1, stride)
 
     def choose_cuda_device(self, n):
         """
@@ -270,6 +275,30 @@ class SignalProcessing():
 
         sig = []
         processed_frames_count = 0
+        cached_ldmks = None
+        cached_face_found = False
+        scale = float(getattr(self, 'holistic_downsample_scale', 1.0))
+        refresh_stride = int(getattr(self, 'holistic_landmark_refresh_stride', 1))
+
+        total_frames = 0
+        cap = cv2.VideoCapture(videoFileName)
+        if cap.isOpened():
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        if self.tot_frames is not None and self.tot_frames > 0:
+            total_frames = min(total_frames, int(self.tot_frames)) if total_frames > 0 else int(self.tot_frames)
+        pbar = None
+        try:
+            pbar = tqdm(
+                total=total_frames if total_frames > 0 else None,
+                desc="RGB holistic frames",
+                unit="fr",
+                file=sys.stdout,
+                disable=not bool(getattr(sys.stdout, "isatty", lambda: False)()),
+            )
+        except OSError:
+            # Some spawned Windows subprocesses expose an invalid std handle.
+            pbar = None
 
         with _suppress_native_stderr():
             with mp_face_mesh.FaceMesh(
@@ -286,19 +315,39 @@ class SignalProcessing():
                     ldmks = np.zeros((468, 5), dtype=np.float32)
                     ldmks[:, 0] = -1.0
                     ldmks[:, 1] = -1.0
-                    ### face landmarks ###
-                    results = face_mesh.process(image)
-                    if results.multi_face_landmarks:
-                        face_landmarks = results.multi_face_landmarks[0]
-                        landmarks = [l for l in face_landmarks.landmark]
-                        for idx in range(len(landmarks)):
-                            landmark = landmarks[idx]
-                            if _landmark_is_valid(landmark):
-                                coords = _normalized_to_pixel_coordinates(
-                                    landmark.x, landmark.y, width, height)
-                                if coords:
-                                    ldmks[idx, 0] = coords[1]
-                                    ldmks[idx, 1] = coords[0]
+                    do_refresh = (processed_frames_count == 1) or (cached_ldmks is None) or ((processed_frames_count - 1) % refresh_stride == 0)
+                    if do_refresh:
+                        ### face landmarks ###
+                        if scale < 0.999:
+                            infer_image = cv2.resize(
+                                image,
+                                None,
+                                fx=scale,
+                                fy=scale,
+                                interpolation=cv2.INTER_AREA,
+                            )
+                        else:
+                            infer_image = image
+                        results = face_mesh.process(infer_image)
+                        if results.multi_face_landmarks:
+                            face_landmarks = results.multi_face_landmarks[0]
+                            landmarks = [l for l in face_landmarks.landmark]
+                            for idx in range(len(landmarks)):
+                                landmark = landmarks[idx]
+                                if _landmark_is_valid(landmark):
+                                    coords = _normalized_to_pixel_coordinates(
+                                        landmark.x, landmark.y, width, height)
+                                    if coords:
+                                        ldmks[idx, 0] = coords[1]
+                                        ldmks[idx, 1] = coords[0]
+                            cached_ldmks = ldmks.copy()
+                            cached_face_found = True
+                        else:
+                            cached_ldmks = None
+                            cached_face_found = False
+
+                    if cached_face_found and cached_ldmks is not None:
+                        ldmks = cached_ldmks
                         ### skin extraction ###
                         cropped_skin_im, full_skin_im = skin_ex.extract_skin(
                             image, ldmks)
@@ -310,9 +359,13 @@ class SignalProcessing():
                     ### sig computing ###
                     sig.append(holistic_mean(
                         cropped_skin_im, np.int32(SignalProcessingParams.RGB_LOW_TH), np.int32(SignalProcessingParams.RGB_HIGH_TH)))
+                    if pbar is not None:
+                        pbar.update(1)
                     ### loop break ###
                     if self.tot_frames is not None and self.tot_frames > 0 and processed_frames_count >= self.tot_frames:
                         break
+        if pbar is not None:
+            pbar.close()
         sig = np.array(sig, dtype=np.float32)
         return sig
 

@@ -2,10 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as functional
 
-try:
-    from queue import Queue
-except ImportError:
-    from Queue import Queue
+from queue import Queue
 
 from .functions import *
 

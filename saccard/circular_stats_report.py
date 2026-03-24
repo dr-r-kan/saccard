@@ -3,13 +3,21 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from scipy.stats import chi2_contingency, chisquare
+
+try:
+    import statsmodels.formula.api as smf
+    STATSMODELS_AVAILABLE = True
+except ImportError:
+    smf = None
+    STATSMODELS_AVAILABLE = False
 
 
 STATE_LABELS = {
@@ -21,6 +29,13 @@ STATE_LABELS = {
 }
 
 STATE_ORDER = ["just_about_to_move", "moving", "just_moved", "fixating"]
+
+
+@dataclass
+class CohortData:
+    df: pd.DataFrame
+    source_files: List[Path]
+    participants: List[str]
 
 
 def circular_mean(angles: np.ndarray, weights: np.ndarray | None = None) -> float:
@@ -66,6 +81,38 @@ def load_timeseries(path: Path) -> pd.DataFrame:
     return df
 
 
+def discover_timeseries_files(input_path: Path, pattern: str = "*_timeseries.csv") -> List[Path]:
+    if input_path.is_file():
+        return [input_path]
+    if input_path.is_dir():
+        return sorted(input_path.glob(pattern))
+    raise FileNotFoundError(f"Input path does not exist: {input_path}")
+
+
+def infer_participant_id(timeseries_path: Path) -> str:
+    stem = infer_prefix(timeseries_path)
+    # Keep participant identity stable for mixed models.
+    return stem.strip() if stem.strip() else timeseries_path.stem
+
+
+def load_cohort_data(files: Sequence[Path]) -> CohortData:
+    rows: List[pd.DataFrame] = []
+    participants: List[str] = []
+    for path in files:
+        df = load_timeseries(path)
+        participant_id = infer_participant_id(path)
+        df = df.copy()
+        df["participant_id"] = participant_id
+        df["source_file"] = str(path)
+        rows.append(df)
+        if participant_id not in participants:
+            participants.append(participant_id)
+    if not rows:
+        raise RuntimeError("No timeseries files loaded")
+    cohort_df = pd.concat(rows, axis=0, ignore_index=True)
+    return CohortData(df=cohort_df, source_files=list(files), participants=participants)
+
+
 def phase_bin_edges(phase_bins: int) -> np.ndarray:
     return np.linspace(0.0, 2.0 * np.pi, phase_bins + 1)
 
@@ -83,6 +130,159 @@ def assign_phase_bins(phase: np.ndarray, phase_bins: int) -> Tuple[np.ndarray, n
     bin_ids = np.digitize(phase, edges, right=False) - 1
     bin_ids = np.clip(bin_ids, 0, phase_bins - 1)
     return bin_ids, edges
+
+
+def build_participant_weighted_profiles(df: pd.DataFrame, phase_bins: int) -> Dict[str, np.ndarray]:
+    velocity_col = "analysis_velocity_abs" if "analysis_velocity_abs" in df.columns else "gaze_velocity_abs"
+    required = ["participant_id", "sync_valid", "cardiac_phase_rad", "blink", velocity_col]
+    for col in required:
+        if col not in df.columns:
+            return {
+                "blink_fraction": np.full(phase_bins, np.nan, dtype=float),
+                "mean_velocity": np.full(phase_bins, np.nan, dtype=float),
+            }
+
+    work = df.loc[df["sync_valid"] & df["cardiac_phase_rad"].notna(), ["participant_id", "cardiac_phase_rad", "blink", velocity_col]].copy()
+    if work.empty:
+        return {
+            "blink_fraction": np.full(phase_bins, np.nan, dtype=float),
+            "mean_velocity": np.full(phase_bins, np.nan, dtype=float),
+        }
+
+    bin_ids, _ = assign_phase_bins(work["cardiac_phase_rad"].to_numpy(dtype=float), phase_bins)
+    work["phase_bin"] = bin_ids
+    work["blink_num"] = work["blink"].astype(float)
+
+    participant_bin = (
+        work.groupby(["participant_id", "phase_bin"], observed=True)
+        .agg(
+            blink_fraction=("blink_num", "mean"),
+            mean_velocity=(velocity_col, "mean"),
+        )
+        .reset_index()
+    )
+
+    agg = participant_bin.groupby("phase_bin", observed=True).agg(
+        blink_fraction=("blink_fraction", "mean"),
+        mean_velocity=("mean_velocity", "mean"),
+    )
+
+    blink_profile = np.full(phase_bins, np.nan, dtype=float)
+    velocity_profile = np.full(phase_bins, np.nan, dtype=float)
+    for idx, row in agg.iterrows():
+        bin_idx = int(idx)
+        if 0 <= bin_idx < phase_bins:
+            blink_profile[bin_idx] = float(row["blink_fraction"])
+            velocity_profile[bin_idx] = float(row["mean_velocity"])
+    return {
+        "blink_fraction": blink_profile,
+        "mean_velocity": velocity_profile,
+    }
+
+
+def fit_circular_lmm(df: pd.DataFrame) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "engine": "statsmodels.mixedlm" if STATSMODELS_AVAILABLE else "unavailable",
+        "available": bool(STATSMODELS_AVAILABLE),
+    }
+    if not STATSMODELS_AVAILABLE:
+        out["error"] = "statsmodels is not installed"
+        return out
+
+    if "participant_id" not in df.columns:
+        out["error"] = "participant_id column missing; cannot fit mixed-effects model"
+        return out
+
+    work = df.copy()
+    work["phase_sin"] = np.sin(work["cardiac_phase_rad"].to_numpy(dtype=float))
+    work["phase_cos"] = np.cos(work["cardiac_phase_rad"].to_numpy(dtype=float))
+
+    models: Dict[str, Any] = {}
+
+    # Continuous velocity model.
+    velocity_col = "analysis_velocity_abs" if "analysis_velocity_abs" in work.columns else "gaze_velocity_abs"
+    if velocity_col in work.columns:
+        vel = work.loc[
+            work["sync_valid"]
+            & work[velocity_col].notna()
+            & work["cardiac_phase_rad"].notna()
+            & work["participant_id"].notna(),
+            ["participant_id", velocity_col, "phase_sin", "phase_cos"],
+        ].copy()
+        vel = vel.rename(columns={velocity_col: "outcome"})
+        vel["participant_id"] = vel["participant_id"].astype(str)
+        if len(vel) >= 10 and vel["participant_id"].nunique() >= 2:
+            try:
+                fit = smf.mixedlm("outcome ~ phase_sin + phase_cos", vel, groups=vel["participant_id"]).fit(reml=False)
+                b_sin = float(fit.params.get("phase_sin", math.nan))
+                b_cos = float(fit.params.get("phase_cos", math.nan))
+                models["velocity_lmm"] = {
+                    "n": int(len(vel)),
+                    "participants": int(vel["participant_id"].nunique()),
+                    "fixed_effects": {k: float(v) for k, v in fit.params.to_dict().items()},
+                    "pvalues": {k: float(v) for k, v in fit.pvalues.to_dict().items()},
+                    "aic": float(fit.aic) if np.isfinite(fit.aic) else math.nan,
+                    "bic": float(fit.bic) if np.isfinite(fit.bic) else math.nan,
+                    "log_likelihood": float(fit.llf),
+                    "circular_amplitude": float(np.sqrt(b_sin ** 2 + b_cos ** 2)),
+                    "preferred_phase_rad": float(np.mod(np.arctan2(b_sin, b_cos), 2.0 * np.pi)),
+                }
+            except Exception as exc:
+                models["velocity_lmm"] = {
+                    "n": int(len(vel)),
+                    "participants": int(vel["participant_id"].nunique()),
+                    "error": repr(exc),
+                }
+        else:
+            models["velocity_lmm"] = {
+                "n": int(len(vel)),
+                "participants": int(vel["participant_id"].nunique()),
+                "error": "Insufficient data for MixedLM (need >=10 rows and >=2 participants)",
+            }
+
+    # Blink model as Gaussian LMM on binary outcome for participant-level dependence adjustment.
+    if "blink" in work.columns:
+        blink_df = work.loc[
+            work["sync_valid"]
+            & work["blink"].notna()
+            & work["cardiac_phase_rad"].notna()
+            & work["participant_id"].notna(),
+            ["participant_id", "blink", "phase_sin", "phase_cos"],
+        ].copy()
+        blink_df["outcome"] = blink_df["blink"].astype(float)
+        blink_df["participant_id"] = blink_df["participant_id"].astype(str)
+        if len(blink_df) >= 10 and blink_df["participant_id"].nunique() >= 2:
+            try:
+                fit = smf.mixedlm("outcome ~ phase_sin + phase_cos", blink_df, groups=blink_df["participant_id"]).fit(reml=False)
+                b_sin = float(fit.params.get("phase_sin", math.nan))
+                b_cos = float(fit.params.get("phase_cos", math.nan))
+                models["blink_lmm_gaussian"] = {
+                    "n": int(len(blink_df)),
+                    "participants": int(blink_df["participant_id"].nunique()),
+                    "fixed_effects": {k: float(v) for k, v in fit.params.to_dict().items()},
+                    "pvalues": {k: float(v) for k, v in fit.pvalues.to_dict().items()},
+                    "aic": float(fit.aic) if np.isfinite(fit.aic) else math.nan,
+                    "bic": float(fit.bic) if np.isfinite(fit.bic) else math.nan,
+                    "log_likelihood": float(fit.llf),
+                    "circular_amplitude": float(np.sqrt(b_sin ** 2 + b_cos ** 2)),
+                    "preferred_phase_rad": float(np.mod(np.arctan2(b_sin, b_cos), 2.0 * np.pi)),
+                    "note": "Gaussian mixed model on binary blink outcome used for dependency-adjusted directional effect screening.",
+                }
+            except Exception as exc:
+                models["blink_lmm_gaussian"] = {
+                    "n": int(len(blink_df)),
+                    "participants": int(blink_df["participant_id"].nunique()),
+                    "error": repr(exc),
+                }
+        else:
+            models["blink_lmm_gaussian"] = {
+                "n": int(len(blink_df)),
+                "participants": int(blink_df["participant_id"].nunique()),
+                "error": "Insufficient data for MixedLM (need >=10 rows and >=2 participants)",
+            }
+
+    out["models"] = models
+    return out
 
 
 def summarize_blinks(df: pd.DataFrame, phase_bins: int) -> Tuple[pd.DataFrame, Dict[str, Any]]:
@@ -207,18 +407,26 @@ def build_report(df: pd.DataFrame, phase_bins: int) -> Tuple[Dict[str, Any], Dic
     blink_summary, blink_stats = summarize_blinks(df, phase_bins)
     velocity_summary, velocity_stats = summarize_velocity(df, phase_bins)
     state_summary, state_stats = summarize_states(df, phase_bins)
+    lmm_stats = fit_circular_lmm(df)
 
     edges = phase_bin_edges(phase_bins)
     labels = phase_bin_labels(edges)
+    weighted_profiles = build_participant_weighted_profiles(df, phase_bins)
     figures = {
         "blink_radar": make_radar_plot(
             labels,
-            [("Blink Fraction", blink_summary["blink_fraction"].fillna(0.0).to_numpy(dtype=float))],
+            [
+                ("Blink Fraction (Pooled)", blink_summary["blink_fraction"].fillna(0.0).to_numpy(dtype=float)),
+                ("Blink Fraction (Participant Mean)", np.nan_to_num(weighted_profiles["blink_fraction"], nan=0.0)),
+            ],
             "Blink Modulation by Cardiac Phase",
         ),
         "velocity_radar": make_radar_plot(
             labels,
-            [("Mean Velocity", velocity_summary["mean_velocity"].fillna(0.0).to_numpy(dtype=float))],
+            [
+                ("Mean Velocity (Pooled)", velocity_summary["mean_velocity"].fillna(0.0).to_numpy(dtype=float)),
+                ("Mean Velocity (Participant Mean)", np.nan_to_num(weighted_profiles["mean_velocity"], nan=0.0)),
+            ],
             "Eye Movement by Cardiac Phase",
         ),
     }
@@ -230,9 +438,13 @@ def build_report(df: pd.DataFrame, phase_bins: int) -> Tuple[Dict[str, Any], Dic
 
     report = {
         "phase_bin_count": phase_bins,
+        "sample_count": int(len(df)),
+        "participant_count": int(df["participant_id"].nunique()) if "participant_id" in df.columns else 1,
+        "participants": sorted(df["participant_id"].dropna().astype(str).unique().tolist()) if "participant_id" in df.columns else [],
         "blink": blink_stats,
         "velocity": velocity_stats,
         "movement_state": state_stats,
+        "circular_lmm": lmm_stats,
     }
     tables = {
         "blink_summary": blink_summary,
@@ -266,23 +478,41 @@ def save_report(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run circular statistics and radar plots on saccardiac outputs.")
-    parser.add_argument("timeseries_csv", help="Path to the synchronized timeseries CSV produced by saccardiac.")
+    parser.add_argument(
+        "input_path",
+        nargs="?",
+        default="outputs",
+        help="Input timeseries CSV file or directory containing *_timeseries.csv files (default: outputs).",
+    )
     parser.add_argument("--phase-bins", type=int, default=12, help="Number of cardiac phase bins.")
     parser.add_argument("--output-dir", default=None, help="Directory for stats tables and radar plots.")
     parser.add_argument("--prefix", default=None, help="Optional output file prefix.")
+    parser.add_argument(
+        "--glob",
+        default="*_timeseries.csv",
+        help="Glob pattern for timeseries discovery when input_path is a directory.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    timeseries_path = Path(args.timeseries_csv)
-    if not timeseries_path.exists():
-        raise FileNotFoundError(f"Timeseries CSV not found: {timeseries_path}")
+    input_path = Path(args.input_path)
+    files = discover_timeseries_files(input_path, pattern=args.glob)
+    if not files:
+        raise RuntimeError(f"No timeseries files found in {input_path} with pattern {args.glob!r}")
 
-    output_dir = Path(args.output_dir) if args.output_dir else timeseries_path.parent
-    prefix = args.prefix or infer_prefix(timeseries_path)
-    df = load_timeseries(timeseries_path)
+    if input_path.is_file():
+        output_dir = Path(args.output_dir) if args.output_dir else input_path.parent
+        prefix = args.prefix or infer_prefix(input_path)
+    else:
+        output_dir = Path(args.output_dir) if args.output_dir else input_path
+        prefix = args.prefix or "cohort"
+
+    cohort = load_cohort_data(files)
+    df = cohort.df
     report, tables, figures = build_report(df, args.phase_bins)
+    report["source_files"] = [str(p) for p in cohort.source_files]
     save_report(output_dir, prefix, report, tables, figures)
     return 0
 

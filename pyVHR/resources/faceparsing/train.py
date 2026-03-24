@@ -109,11 +109,14 @@ def train():
     diter = iter(dl)
     epoch = 0
     for it in range(max_iter):
-        try:
-            im, lb = next(diter)
-            if not im.size()[0] == n_img_per_gpu:
-                raise StopIteration
-        except StopIteration:
+        sample = next(diter, None)
+        if sample is None:
+            epoch += 1
+            sampler.set_epoch(epoch)
+            diter = iter(dl)
+            sample = next(diter)
+        im, lb = sample
+        if not im.size()[0] == n_img_per_gpu:
             epoch += 1
             sampler.set_epoch(epoch)
             diter = iter(dl)

@@ -1,9 +1,8 @@
-try:
-    import cupy
-    _cupy_available = True
-except ImportError:
-    cupy = None
-    _cupy_available = False
+import importlib
+import importlib.util
+
+cupy = None
+_cupy_available = False
 import numpy as np
 from scipy.signal import  stft
 import plotly.graph_objects as go
@@ -67,9 +66,8 @@ class BVPsignal:
         """Show the spectrogram of the BVP signal"""
 
         # -- check if bpm exists
-        try:
-            bpm = self.bpm
-        except AttributeError:
+        bpm = getattr(self, "bpm", None)
+        if bpm is None:
             self.spectrogram()
             bpm = self.bpm
 
