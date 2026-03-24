@@ -31,10 +31,14 @@ Plus the deep-learning method **`MTTS_CAN`** (Liu et al., 2020).
 ## Installation
 
 The default install path is CPU-first and should be the safest option on a fresh machine.
+This is the intended baseline for newer Python runtimes such as Python 3.12.
 
-Clone the repository, then run:
+Create a Python 3.12 virtual environment, then install the core package:
 ```bash
-pip install -r requirements.txt
+py -3.12 -m venv .venv312
+.venv312\Scripts\activate
+python -m pip install --upgrade pip
+pip install -e .
 ```
 
 Optional installs:
@@ -49,11 +53,26 @@ pip install -r requirements-gpu.txt
 pip install -r requirements-faceparsing.txt
 ```
 
+- TensorFlow for the optional `MTTS_CAN` backend:
+```bash
+pip install -r requirements-mtts-can.txt
+```
+
 Notes:
 
 - The default pipeline does not require GPU packages.
+- The default pipeline does not require TensorFlow unless you request `MTTS_CAN`.
 - GPU execution is enabled only when the environment is appropriate and CUDA is actually available.
 - You can force CPU mode even in a GPU-capable environment by setting `SACCARD_DISABLE_GPU=1`.
+
+## Build
+
+To build a wheel or source distribution from the new `pyproject.toml` metadata:
+
+```bash
+python -m pip install build
+python -m build
+```
 
 ## Quick start
 

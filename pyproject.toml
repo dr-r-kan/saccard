@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "saccard"
+version = "0.1.0"
+description = "Passive video pipeline for cardiac and eye-movement extraction."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = { file = "LICENSE" }
+dependencies = [
+  "numpy>=1.26,<2.1",
+  "scipy>=1.11",
+  "pandas>=2.1",
+  "opencv-python>=4.10",
+  "mediapipe>=0.10.18,<0.11",
+  "absl-py>=2.1",
+  "plotly>=5.18",
+  "matplotlib>=3.8",
+  "Pillow>=10.2",
+  "ipython>=8.18",
+  "ipywidgets>=8.1",
+  "tqdm>=4.66",
+  "scikit-learn>=1.4",
+  "scikit-image>=0.22",
+  "statsmodels>=0.14",
+  "numba>=0.59",
+  "lmfit>=1.2",
+  "requests>=2.31",
+]
+
+[project.optional-dependencies]
+gpu = [
+  "cupy-cuda12x>=13.3",
+]
+faceparsing = [
+  "torch>=2.4",
+  "torchvision>=0.19",
+]
+mtts-can = [
+  "tensorflow>=2.16",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["saccard*", "pyVHR*"]
+
+[tool.setuptools.package-data]
+pyVHR = ["resources/**/*"]

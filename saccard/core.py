@@ -453,7 +453,13 @@ def saccard(
     if run_mtts and raw_frames is not None and len(raw_frames) > 0:
         if verb:
             print("[saccard] running MTTS-CAN …")
-        from pyVHR.deepRPPG.mtts_can import MTTS_CAN_deep
+        try:
+            from pyVHR.deepRPPG.mtts_can import MTTS_CAN_deep
+        except ImportError as exc:
+            raise ImportError(
+                "MTTS_CAN was requested but its optional TensorFlow dependency is not installed. "
+                "Install requirements-mtts-can.txt or remove MTTS_CAN from the requested methods."
+            ) from exc
         pulse = MTTS_CAN_deep(raw_frames, fps, verb=0)
         bvp_out['MTTS_CAN'] = pulse          # 1-D array
         bpm_out['MTTS_CAN'] = _bpm_from_1d_bvp(pulse, fps, winsize)

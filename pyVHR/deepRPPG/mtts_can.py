@@ -16,9 +16,11 @@ from skimage.util import img_as_float
 from scipy.sparse import spdiags
 
 tf.get_logger().setLevel('ERROR')
-from tensorflow.python.util import deprecation as _tf_deprecation
-if hasattr(_tf_deprecation, '_PRINT_DEPRECATION_WARNINGS'):
-  _tf_deprecation._PRINT_DEPRECATION_WARNINGS = False
+
+try:
+  tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
+except Exception:
+  pass
 
 def preprocess_raw_video(frames, fs=30, dim=36):
   """A slightly different version from the original: 
@@ -100,7 +102,8 @@ def MTTS_CAN_deep(frames, fs, model_checkpoint=None, batch_size=100, dim=36, img
     if not os.path.isfile(model_checkpoint):
       url = "https://github.com/phuselab/pyVHR/raw/master/resources/deepRPPG/mtts_can_model.hdf5"
       print('Downloading MTTS_CAN model...')
-      r = requests.get(url, allow_redirects=True)
+      r = requests.get(url, allow_redirects=True, timeout=60)
+      r.raise_for_status()
       open(model_checkpoint, 'wb').write(r.content)   
 
   # frame preprocessing

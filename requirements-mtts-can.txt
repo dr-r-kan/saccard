@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Optional deep-learning backend used only when requesting MTTS_CAN.
+tensorflow>=2.16
